@@ -11,24 +11,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
+      - uses: ilammy/msvc-dev-cmd@v1
 
-      # Small exe (~a few hundred KB). Needs ".NET 10 Desktop Runtime" installed on your PC.
-      - name: Publish (small, framework-dependent)
-        run: dotnet publish QuickPalette.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o out/small
-
-      # Big exe, runs anywhere with nothing installed.
-      - name: Publish (standalone)
-        run: dotnet publish QuickPalette.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o out/standalone
+      # Static runtime (/MT): the exe needs NOTHING installed on your PC.
+      - name: Compile
+        shell: cmd
+        run: cl /nologo /utf-8 /std:c++17 /O1 /GL /MT /EHsc /DUNICODE /D_UNICODE main.cpp /Fe:QuickPalette.exe /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
 
       - uses: actions/upload-artifact@v4
         with:
-          name: QuickPalette-small-needs-dotnet10-runtime
-          path: out/small/QuickPalette.exe
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: QuickPalette-standalone
-          path: out/standalone/QuickPalette.exe
+          name: QuickPalette
+          path: QuickPalette.exe
