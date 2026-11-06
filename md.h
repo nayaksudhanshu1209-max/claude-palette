@@ -333,9 +333,9 @@ struct MdView {
                     f.col = li.st.hl ? 0xFFFFFFFF : 0xFFFFFFFE;   // placeholders resolved at draw time
                     ops.push_back(f);
                 }
-                MdOp o; o.type = OP_TEXT; o.r = { cx, y, std::min(cx + li.w, x1 + (wrap ? 0 : 0)), y + lh };
+                MdOp o; o.type = OP_TEXT; o.r = { cx, y, std::min<int>(cx + li.w, x1 + (wrap ? 0 : 0)), y + lh };
                 o.by = y + asc + LS / 2; o.text = li.text; o.st = li.st; o.fkey = li.key;
-                if (!wrap) o.r.right = std::min(cx + li.w, x1);
+                if (!wrap) o.r.right = std::min<int>(cx + li.w, x1);
                 ops.push_back(o);
                 cx += li.w;
             }
@@ -555,7 +555,7 @@ struct MdView {
                 ExtTextOutW(dc, r.left, op.by + oy, ETO_CLIPPED, &clip, op.text.c_str(), (UINT)op.text.size(), nullptr);
                 SetTextAlign(dc, TA_LEFT | TA_TOP);
                 SIZE sz; GetTextExtentPoint32W(dc, op.text.c_str(), (int)op.text.size(), &sz);
-                int w = std::min((int)sz.cx, (int)(r.right - r.left));
+                int w = std::min<int>((int)sz.cx, (int)(r.right - r.left));
                 if (op.st.link >= 0 || op.st.s) {
                     HPEN pen = CreatePen(PS_SOLID, 1, col); HGDIOBJ o = SelectObject(dc, pen);
                     int ly = op.st.s ? (op.by + oy - it->second.asc / 3) : (op.by + oy + 2);
