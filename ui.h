@@ -127,13 +127,13 @@ static int SearchH() { return std::max(SearchPadV() * 2 + g_qLines * g_lineH, px
 static int ItemH() { return px(g_compact ? 38 : 50); }
 static int HdrH() { return px(g_compact ? 24 : 28); }
 static int FootH() { return g_showFooter ? px(g_compact ? 24 : 28) : 0; }
-static int PalW() { return std::min(px(g_width), (int)(g_work.right - g_work.left) - px(8)); }
+static int PalW() { return std::min<int>(px(g_width), (int)(g_work.right - g_work.left) - px(8)); }
 static int ContentH() { int h = 0; for (auto& r : g_rows) h += r.header ? HdrH() : ItemH(); return h; }
 static int ListH() { return std::min(ContentH(), px(g_listMax)); }
 static int ListTop() { return SearchH() + 1 + px(4); }
 static int PalH() { int h = SearchH(); if (!g_rows.empty()) h += 1 + px(4) + ListH() + px(g_showFooter ? 6 : 8) + FootH(); return h; }
-static int NoteW() { return std::max(px(480), std::min(px(g_noteW), (int)(g_work.right - g_work.left) - px(24))); }
-static int NoteH() { return std::max(px(320), std::min(px(g_noteH), (int)(g_work.bottom - g_work.top) - px(24))); }
+static int NoteW() { return std::max<int>(px(480), std::min<int>(px(g_noteW), (int)(g_work.right - g_work.left) - px(24))); }
+static int NoteH() { return std::max<int>(px(320), std::min<int>(px(g_noteH), (int)(g_work.bottom - g_work.top) - px(24))); }
 
 static void PlaceWindow(int w, int h, bool show) {
     int x = g_anchor.x, y = g_anchor.y;
@@ -310,7 +310,7 @@ static bool ListThumb(RECT& track, RECT& thumb) {
     if (ch <= lh) return false;
     int W = PalW();
     track = { W - px(9), ListTop() + px(2), W - px(4), ListTop() + lh - px(2) };
-    int th = std::max(px(24), (track.bottom - track.top) * lh / ch);
+    int th = std::max<int>(px(24), (track.bottom - track.top) * lh / ch);
     int ty = track.top + (int)((long long)g_scroll * ((track.bottom - track.top) - th) / (ch - lh));
     thumb = { track.left, ty, track.right, ty + th };
     return true;
@@ -359,7 +359,7 @@ static void DrawPalette(HDC dc, int W, int H) {
                 } else {
                     SelectObject(dc, g_fTitle);
                     SIZE sz; GetTextExtentPoint32W(dc, it.title.c_str(), (int)it.title.size(), &sz);
-                    int tw = std::min((int)sz.cx, (right - tx) * 65 / 100);
+                    int tw = std::min<int>((int)sz.cx, (right - tx) * 65 / 100);
                     TextAt(dc, g_fTitle, T.text, it.title, { tx, y, tx + tw, y + h }, DT_VCENTER);
                     int sx = tx + tw + px(12);
                     if (sx < right - px(30)) TextAt(dc, g_fSub, T.dim, it.sub, { sx, y, right, y + h }, DT_VCENTER);
@@ -495,7 +495,7 @@ static bool PvThumb(RECT& track, RECT& thumb) {
     int vh = pa.bottom - pa.top;
     if (g_pvH <= vh) return false;
     track = { pa.right - px(9), pa.top + px(4), pa.right - px(4), pa.bottom - px(4) };
-    int th = std::max(px(28), (track.bottom - track.top) * vh / g_pvH);
+    int th = std::max<int>(px(28), (track.bottom - track.top) * vh / g_pvH);
     int ty = track.top + (int)((long long)g_pvScroll * ((track.bottom - track.top) - th) / (g_pvH - vh));
     thumb = { track.left, ty, track.right, ty + th };
     return true;
@@ -503,7 +503,7 @@ static bool PvThumb(RECT& track, RECT& thumb) {
 static void ClampPv() {
     int W, H; ClientWH(W, H);
     RECT pa = PreviewArea(W, H);
-    g_pvScroll = std::max(0, std::min(g_pvScroll, std::max(0, g_pvH - (pa.bottom - pa.top))));
+    g_pvScroll = std::max<int>(0, std::min<int>(g_pvScroll, std::max<int>(0, g_pvH - (pa.bottom - pa.top))));
 }
 static void LayoutPreview() {
     if (!g_noteMode || g_noteView == 0) return;
@@ -851,7 +851,7 @@ static void NoteMouseDown(int x, int y) {
         if (!InRect(th, x, y)) {   // clicked the track: jump there
             int vh; { int W, H; ClientWH(W, H); RECT pa = PreviewArea(W, H); vh = pa.bottom - pa.top; }
             int thH = th.bottom - th.top;
-            g_pvScroll = (int)((long long)(y - tr.top - thH / 2) * (g_pvH - vh) / std::max(1, (tr.bottom - tr.top) - thH));
+            g_pvScroll = (int)((long long)(y - tr.top - thH / 2) * (g_pvH - vh) / std::max<int>(1, (tr.bottom - tr.top) - thH));
             ClampPv(); g_dragY = y; g_dragScroll = g_pvScroll;
             InvalidateRect(g_hwnd, nullptr, FALSE);
         }
@@ -879,7 +879,7 @@ static void NoteMouseMove(int x, int y) {
             int W, H; ClientWH(W, H);
             RECT pa = PreviewArea(W, H);
             int vh = pa.bottom - pa.top, thH = th.bottom - th.top;
-            g_pvScroll = g_dragScroll + (int)((long long)(y - g_dragY) * (g_pvH - vh) / std::max(1, (tr.bottom - tr.top) - thH));
+            g_pvScroll = g_dragScroll + (int)((long long)(y - g_dragY) * (g_pvH - vh) / std::max<int>(1, (tr.bottom - tr.top) - thH));
             ClampPv();
             InvalidateRect(g_hwnd, nullptr, FALSE);
         }
@@ -1108,7 +1108,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT tr, th;
                 if (ListThumb(tr, th)) {
                     int thH = th.bottom - th.top;
-                    g_scroll = g_dragScroll + (int)((long long)(y - g_dragY) * (ContentH() - ListH()) / std::max(1, (tr.bottom - tr.top) - thH));
+                    g_scroll = g_dragScroll + (int)((long long)(y - g_dragY) * (ContentH() - ListH()) / std::max<int>(1, (tr.bottom - tr.top) - thH));
                     ClampListScroll();
                     InvalidateRect(h, nullptr, FALSE);
                 }
