@@ -13,6 +13,7 @@
 #include <shlwapi.h>
 #include <dwmapi.h>
 #include <shellscalingapi.h>
+#include <powrprof.h>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -30,14 +31,15 @@
 #pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "uuid.lib")
-#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#pragma comment(lib, "powrprof.lib")
 
 using std::wstring;
 using std::vector;
 
 // ------------------------------------------------------------------ types
-enum Cat { C_APP, C_SET, C_CMD, C_CALC, C_OPEN, C_WEB, C_BANG, C_COUNT };
-enum Kind { K_NONE, K_OPEN, K_APP, K_LOCK, K_RECYCLE, K_QUIT, K_EDITCFG, K_RELOAD, K_UNHIDE, K_EDITHIDDEN, K_COPY, K_CFGDIR };
+enum Cat { C_APP, C_SET, C_CMD, C_CALC, C_OPEN, C_WEB, C_BANG, C_FILE, C_SNIP, C_COUNT };
+enum Kind { K_NONE, K_OPEN, K_APP, K_LOCK, K_RECYCLE, K_QUIT, K_EDITCFG, K_RELOAD, K_UNHIDE, K_EDITHIDDEN, K_COPY, K_CFGDIR,
+            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX };
 
 struct Item {
     wstring id, title, sub, tl, kl, group;
@@ -46,8 +48,9 @@ struct Item {
     bool track = false, confirm = false, hide = false;
     int score = 0;
     Kind kind = K_NONE;
-    wstring a, b;
+    wstring a, b, alt;
 };
+struct Snippet { wstring name, text; };
 struct Bang { wstring trig, name, url; };
 struct AppEntry { wstring name, id; };
 struct CustomCmd { wstring name, kw, target, args; };
@@ -57,17 +60,25 @@ struct Row { bool header; int idx; wstring text; };
 static HINSTANCE g_inst;
 static HWND g_hwnd;
 static const wchar_t* kClass = L"QuickPaletteWnd";
-static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3;
+static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3, WM_FILES_READY = WM_APP + 4;
 static UINT g_wmTaskbar;
 enum { T_BOOT = 1, T_TRIM = 2 };
 
-static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath;
+static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath, g_filesPath;
 static wstring g_hotkey = L"Ctrl+Space", g_defaultBang = L"g";
-static bool g_startup = true, g_boot = false, g_menuOpen = false;
+static bool g_startup = false, g_boot = false, g_menuOpen = false;
 static ULONGLONG g_cfgStamp = 0;
 
 static vector<Bang> g_bangs;
 static vector<CustomCmd> g_cmds;
+static vector<Snippet> g_snippets;
+static vector<wstring> g_folders;
+static wstring g_fileTrigger = L"f";
+static int g_fileDepth = 6, g_fileMax = 50000;
+static bool g_firstRun = false;
+static vector<wstring> g_files;
+static bool g_filesLoaded = false;
+static volatile LONG g_filesBusy = 0;
 static vector<AppEntry> g_apps;
 static bool g_appsLoaded = false, g_catalogDirty = true, g_stateLoaded = false;
 static vector<Item> g_catalog;
@@ -159,8 +170,21 @@ static void DefaultConfig() {
         L"# (Win+Space is reserved by Windows and cannot be used.)\n"
         L"hotkey=Ctrl+Space\n"
         L"\n"
-        L"# 1 = start with Windows (delayed + low priority so it never slows boot), 0 = off\n"
-        L"startup=1\n"
+        L"# 1 = start with Windows (waits ~45 s and runs at low priority so it never slows boot), 0 = off\n"
+        L"# You can also type \"start with windows\" in the palette to switch this.\n"
+        L"startup=0\n"
+        L"\n"
+        L"# File search: type  f report  to search file and folder NAMES in the folders below.\n"
+        L"# Add as many folder= lines as you like. With none, Desktop + Documents + Downloads are used.\n"
+        L"# Only these folders are indexed (never the whole drive) so it stays light.\n"
+        L"# folder=D:\\Projects\n"
+        L"# folder=%USERPROFILE%\\Pictures\n"
+        L"file_trigger=f\n"
+        L"file_depth=6\n"
+        L"file_max=50000\n"
+        L"\n"
+        L"# Snippets: snippet=Name|text that gets copied to the clipboard when you press Enter\n"
+        L"# snippet=My email|me@example.com\n"
         L"\n"
         L"# Trigger of the bang used by the \"Search the web\" row\n"
         L"default_bang=g\n"
@@ -186,10 +210,10 @@ static void DefaultConfig() {
 }
 
 static void LoadConfig() {
-    if (!PathFileExistsW(g_cfgPath.c_str())) DefaultConfig();
+    if (!PathFileExistsW(g_cfgPath.c_str())) { DefaultConfig(); g_firstRun = true; }
     vector<wstring> lines;
     ReadLines(g_cfgPath, lines);
-    g_bangs.clear(); g_cmds.clear();
+    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear();
     for (auto& raw : lines) {
         wstring l = Trim(raw);
         if (l.empty() || l[0] == L'#') continue;
@@ -199,6 +223,14 @@ static void LoadConfig() {
         if (k == L"hotkey") g_hotkey = v;
         else if (k == L"startup") g_startup = (v != L"0");
         else if (k == L"default_bang") g_defaultBang = v;
+        else if (k == L"folder") { if (!v.empty()) g_folders.push_back(v); }
+        else if (k == L"file_trigger") { if (!v.empty()) g_fileTrigger = v; }
+        else if (k == L"file_depth") g_fileDepth = std::max(1, std::min(12, _wtoi(v.c_str())));
+        else if (k == L"file_max") g_fileMax = std::max(1000, std::min(300000, _wtoi(v.c_str())));
+        else if (k == L"snippet") {
+            size_t b = v.find(L'|');
+            if (b != wstring::npos && b > 0) g_snippets.push_back({ Trim(v.substr(0, b)), Trim(v.substr(b + 1)) });
+        }
         else if (k == L"bang") {
             auto p = Split(v, L'|');
             if (p.size() >= 3) g_bangs.push_back({ Trim(p[0]), Trim(p[1]), Trim(p[2]) });
@@ -221,6 +253,23 @@ static void SyncStartup() {
         RegSetValueExW(k, L"QuickPalette", 0, REG_SZ, (const BYTE*)v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
     } else RegDeleteValueW(k, L"QuickPalette");
     RegCloseKey(k);
+}
+
+static void SetConfigValue(const wstring& key, const wstring& val) {
+    vector<wstring> ln;
+    ReadLines(g_cfgPath, ln);
+    bool done = false;
+    for (auto& l : ln) {
+        wstring t = Trim(l);
+        size_t eq = t.find(L'=');
+        if (!t.empty() && t[0] != L'#' && eq != wstring::npos && lower(Trim(t.substr(0, eq))) == key) { l = key + L"=" + val; done = true; }
+    }
+    if (!done) ln.push_back(key + L"=" + val);
+    wstring out;
+    for (auto& l : ln) out += l + L"\n";
+    WriteText(g_cfgPath, out);
+    LoadConfig();
+    SyncStartup();
 }
 
 static bool ParseHotkey(const wstring& s, UINT& mods, UINT& vk) {
@@ -273,19 +322,19 @@ static void LoadState() {
 static wchar_t DefaultGlyph(Cat c) {
     switch (c) {
         case C_APP: return 0xE71D; case C_SET: return 0xE713; case C_CMD: return 0xE756;
-        case C_CALC: return 0xE8EF; case C_OPEN: return 0xE8A7; default: return 0xE774;
+        case C_CALC: return 0xE8EF; case C_OPEN: return 0xE8A7; case C_FILE: return 0xE8A5; case C_SNIP: return 0xE8C8; default: return 0xE774;
     }
 }
 static const wchar_t* CatName(Cat c) {
     switch (c) {
         case C_APP: return L"Apps"; case C_SET: return L"Settings"; case C_CMD: return L"Commands";
-        case C_CALC: return L"Calculator"; case C_OPEN: return L"Open"; case C_WEB: return L"Web"; default: return L"Web search";
+        case C_CALC: return L"Calculator"; case C_OPEN: return L"Open"; case C_WEB: return L"Web"; case C_FILE: return L"Files"; case C_SNIP: return L"Snippets"; default: return L"Web search";
     }
 }
 static COLORREF Accent(Cat c) {
     switch (c) {
         case C_APP: return RGB(59, 130, 246); case C_SET: return RGB(20, 184, 166); case C_CMD: return RGB(245, 158, 11);
-        case C_CALC: return RGB(236, 72, 153); case C_OPEN: return RGB(100, 116, 139); default: return RGB(168, 85, 247);
+        case C_CALC: return RGB(236, 72, 153); case C_OPEN: return RGB(100, 116, 139); case C_FILE: return RGB(234, 179, 8); case C_SNIP: return RGB(34, 197, 94); default: return RGB(168, 85, 247);
     }
 }
 
@@ -382,10 +431,10 @@ static void BuildCatalog() {
 
     // commands
     Add(v, L"cmd:lock", L"Lock", L"Lock this PC", L"lock screen", C_CMD, 0xE72E, K_LOCK);
-    Add(v, L"cmd:sleep", L"Sleep", L"Put this PC to sleep", L"suspend", C_CMD, 0xE708, K_OPEN, L"rundll32.exe", L"powrprof.dll,SetSuspendState 0,1,0", false, true);
-    Add(v, L"cmd:signout", L"Sign out", L"Sign out of Windows", L"log off logout", C_CMD, 0xE7E8, K_OPEN, L"shutdown.exe", L"/l", true, true);
-    Add(v, L"cmd:restart", L"Restart", L"Restart this PC", L"reboot", C_CMD, 0xE777, K_OPEN, L"shutdown.exe", L"/r /t 0", true, true);
-    Add(v, L"cmd:shutdown", L"Shut down", L"Turn off this PC", L"power off turn off", C_CMD, 0xE7E8, K_OPEN, L"shutdown.exe", L"/s /t 0", true, true);
+    Add(v, L"cmd:sleep", L"Sleep", L"Put this PC to sleep", L"suspend", C_CMD, 0xE708, K_SLEEP);
+    Add(v, L"cmd:signout", L"Sign out", L"Sign out of Windows", L"log off logout", C_CMD, 0xE7E8, K_LOGOFF, L"", L"", true);
+    Add(v, L"cmd:restart", L"Restart", L"Restart this PC", L"reboot", C_CMD, 0xE777, K_RESTART, L"", L"", true);
+    Add(v, L"cmd:shutdown", L"Shut down", L"Turn off this PC", L"power off turn off", C_CMD, 0xE7E8, K_SHUTDOWN, L"", L"", true);
     Add(v, L"cmd:recycle", L"Empty Recycle Bin", L"Permanently delete everything in it", L"trash garbage clean", C_CMD, 0xE74D, K_RECYCLE, L"", L"", true);
     Add(v, L"cmd:taskmgr", L"Task Manager", L"See running processes", L"processes kill end task performance", C_CMD, 0xE9D9, K_OPEN, L"taskmgr.exe");
     Add(v, L"cmd:explorer", L"File Explorer", L"Open File Explorer", L"files folders", C_CMD, 0xE8B7, K_OPEN, L"explorer.exe");
@@ -398,6 +447,22 @@ static void BuildCatalog() {
     Add(v, L"cmd:edithidden", L"Edit hidden items list", L"hidden.txt - delete a line to unhide one item", L"show restore", C_CMD, 0xE7B3, K_EDITHIDDEN);
     Add(v, L"cmd:cfgdir", L"Open config folder", L"Where Quick Palette keeps its files", L"settings", C_CMD, 0xE838, K_CFGDIR);
     Add(v, L"cmd:quit", L"Quit Quick Palette", L"Exit the app", L"close exit", C_CMD, 0xE711, K_QUIT);
+
+    Add(v, L"cmd:startup-on", L"Start with Windows: turn on", L"Launch Quick Palette at login (delayed, low priority)", L"startup autostart boot login", C_CMD, 0xE7E8, K_STARTUP_ON);
+    Add(v, L"cmd:startup-off", L"Start with Windows: turn off", L"Stop launching at login", L"startup autostart boot login disable", C_CMD, 0xE7E8, K_STARTUP_OFF);
+    Add(v, L"cmd:reindex", L"Rebuild file index", L"Re-scan the folders used by file search", L"files refresh update search", C_CMD, 0xE72C, K_REINDEX);
+
+    // quick folders
+    struct QF { const wchar_t* id; const wchar_t* title; const wchar_t* target; };
+    static const QF qf[] = {
+        { L"docs", L"Documents", L"shell:Personal" }, { L"downloads", L"Downloads", L"shell:Downloads" },
+        { L"desktop", L"Desktop", L"shell:Desktop" }, { L"pictures", L"Pictures", L"shell:My Pictures" },
+        { L"music", L"Music", L"shell:My Music" }, { L"videos", L"Videos", L"shell:My Video" },
+        { L"recyclebin", L"Recycle Bin", L"shell:RecycleBinFolder" }, { L"thispc", L"This PC", L"shell:MyComputerFolder" },
+        { L"startupfolder", L"Startup folder", L"shell:Startup" }, { L"appdata", L"AppData folder", L"shell:AppData" },
+        { L"temp", L"Temp folder", L"%TEMP%" },
+    };
+    for (auto& f : qf) Add(v, wstring(L"cmd:folder-") + f.id, f.title, L"Open folder", L"folder files directory", C_CMD, 0xE8B7, K_OPEN, f.target);
 
     // settings
     for (const wchar_t* line : kSettings) {
@@ -412,6 +477,9 @@ static void BuildCatalog() {
     // user commands
     for (auto& c : g_cmds)
         Add(v, L"cmd:custom:" + c.name, c.name, L"Custom command \u00B7 " + c.target, c.kw, C_CMD, 0xE756, K_OPEN, c.target, c.args);
+
+    // snippets
+    for (auto& sn : g_snippets) Add(v, L"snip:" + sn.name, sn.name, L"Snippet \u00B7 Enter copies it", L"", C_SNIP, 0, K_COPY, sn.text);
 
     // apps
     for (auto& a : g_apps) Add(v, L"app:" + a.id, a.name, L"Application", L"", C_APP, 0, K_APP, a.id);
@@ -489,6 +557,100 @@ static DWORD WINAPI AppsThread(LPVOID) {
 static void StartAppsThread() {
     HANDLE h = CreateThread(nullptr, 0, AppsThread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
+}
+
+// ------------------------------------------------------------------ file index (only YOUR folders, background thread)
+static vector<wstring> EffectiveFolders() {
+    vector<wstring> r;
+    for (auto& f : g_folders) {
+        wstring e = ExpandEnv(f);
+        while (e.size() > 3 && (e.back() == L'\\' || e.back() == L'/')) e.pop_back();
+        if (!e.empty()) r.push_back(e);
+    }
+    if (r.empty()) {
+        const KNOWNFOLDERID* ids[] = { &FOLDERID_Desktop, &FOLDERID_Documents, &FOLDERID_Downloads };
+        for (auto id : ids) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(*id, 0, nullptr, &p)) && p) { r.push_back(p); CoTaskMemFree(p); }
+        }
+    }
+    return r;
+}
+static wstring FolderSig() {
+    wstring s = L"#";
+    for (auto& f : EffectiveFolders()) s += f + L"|";
+    return s + std::to_wstring(g_fileDepth) + L"/" + std::to_wstring(g_fileMax);
+}
+static bool FilesCacheFresh() {
+    ULONGLONG st = Stamp(g_filesPath);
+    if (!st) return false;
+    FILETIME now; GetSystemTimeAsFileTime(&now);
+    ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime;
+    if (n - st > 864000000000ULL) return false;   // older than 24h
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, g_filesPath.c_str(), L"r, ccs=UTF-8") != 0 || !f) return false;
+    wchar_t buf[4096]; wstring first;
+    if (fgetws(buf, 4096, f)) first = buf;
+    fclose(f);
+    while (!first.empty() && (first.back() == L'\n' || first.back() == L'\r')) first.pop_back();
+    return first == FolderSig();
+}
+static void EnsureFiles() {
+    if (g_filesLoaded) return;
+    g_filesLoaded = true;
+    vector<wstring> ln;
+    if (!ReadLines(g_filesPath, ln) || ln.empty() || ln[0] != FolderSig()) return;
+    ln.erase(ln.begin());
+    g_files = std::move(ln);
+}
+
+struct ScanJob { vector<wstring> folders; int depth, max; wstring sig; };
+
+static void ScanFolder(const wstring& dir, int depth, int maxDepth, int maxCount, vector<wstring>& out) {
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((int)out.size() >= maxCount) break;
+        const wchar_t* n = fd.cFileName;
+        if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) continue;
+        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
+        wstring full = dir + L"\\" + n;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   // no junction loops
+            if (!_wcsicmp(n, L"node_modules") || !_wcsicmp(n, L".git") || !_wcsicmp(n, L"$RECYCLE.BIN") || !_wcsicmp(n, L"System Volume Information")) continue;
+            out.push_back(full + L"\\");
+            if (depth < maxDepth) ScanFolder(full, depth + 1, maxDepth, maxCount, out);
+        } else out.push_back(full);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+static DWORD WINAPI FilesThread(LPVOID param) {
+    ScanJob* job = (ScanJob*)param;
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    auto* out = new vector<wstring>();
+    for (auto& f : job->folders) {
+        if ((int)out->size() >= job->max) break;
+        ScanFolder(f, 1, job->depth, job->max, *out);
+    }
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, g_filesPath.c_str(), L"w, ccs=UTF-8") == 0 && f) {
+        fputws((job->sig + L"\n").c_str(), f);
+        for (auto& p : *out) { fputws(p.c_str(), f); fputws(L"\n", f); }
+        fclose(f);
+    }
+    delete job;
+    PostMessageW(g_hwnd, WM_FILES_READY, 0, (LPARAM)out);
+    InterlockedExchange(&g_filesBusy, 0);
+    return 0;
+}
+static void StartFilesThread() {
+    if (InterlockedCompareExchange(&g_filesBusy, 1, 0) != 0) return;
+    auto* job = new ScanJob{ EffectiveFolders(), g_fileDepth, g_fileMax, FolderSig() };
+    HANDLE h = CreateThread(nullptr, 0, FilesThread, job, 0, nullptr);
+    if (h) CloseHandle(h);
+    else { delete job; InterlockedExchange(&g_filesBusy, 0); }
 }
 
 // ------------------------------------------------------------------ calculator
@@ -591,6 +753,140 @@ static bool LooksLikeUrl(const wstring& q) {
     return false;
 }
 
+static vector<Item> FileQuery(const wstring& text) {
+    EnsureFiles();
+    vector<Item> res;
+    wstring ql = lower(text);
+    vector<wstring> toks;
+    for (auto& t : Split(ql, L' ')) if (!t.empty()) toks.push_back(t);
+    auto hint = [&](const wstring& title, const wstring& sub) {
+        Item it; it.cat = C_FILE; it.group = L"Files"; it.glyph = 0xE721; it.title = title; it.sub = sub; it.kind = K_NONE;
+        res.push_back(it);
+    };
+    if (toks.empty()) {
+        hint(L"Search your files", g_files.empty() ? L"Index is empty or still building \u00B7 set folder= lines in config.ini"
+                                                    : std::to_wstring(g_files.size()) + L" items indexed \u00B7 type part of a name");
+        return res;
+    }
+    struct Sc { int idx, s; };
+    vector<Sc> c;
+    for (size_t i = 0; i < g_files.size(); i++) {
+        const wstring& p = g_files[i];
+        size_t end = p.size();
+        if (end && p[end - 1] == L'\\') end--;
+        size_t sl = end ? p.rfind(L'\\', end - 1) : wstring::npos;
+        size_t st = (sl == wstring::npos) ? 0 : sl + 1;
+        wstring name = lower(p.substr(st, end - st));
+        wstring lp; bool have = false;
+        int sum = 0; bool ok = true;
+        for (auto& t : toks) {
+            int x = ScoreOne(t, name, L"");
+            if (!x) {
+                if (!have) { lp = lower(p); have = true; }
+                if (lp.find(t) != wstring::npos) x = 15; else { ok = false; break; }
+            }
+            sum += x;
+        }
+        if (ok) c.push_back({ (int)i, sum / (int)toks.size() });
+    }
+    size_t n = std::min<size_t>(c.size(), 12);
+    std::partial_sort(c.begin(), c.begin() + n, c.end(), [](const Sc& a, const Sc& b) {
+        if (a.s != b.s) return a.s > b.s;
+        return g_files[a.idx].size() < g_files[b.idx].size();
+    });
+    for (size_t i = 0; i < n; i++) {
+        const wstring& p = g_files[c[i].idx];
+        bool dir = !p.empty() && p.back() == L'\\';
+        size_t end = dir ? p.size() - 1 : p.size();
+        size_t sl = p.rfind(L'\\', end ? end - 1 : 0);
+        size_t st = (sl == wstring::npos) ? 0 : sl + 1;
+        Item it; it.cat = C_FILE; it.group = L"Files"; it.glyph = dir ? 0xE8B7 : 0xE8A5;
+        it.title = p.substr(st, end - st);
+        it.sub = (sl == wstring::npos) ? p : p.substr(0, sl);
+        it.kind = K_OPEN; it.a = p; it.alt = p;
+        res.push_back(it);
+    }
+    if (res.empty()) hint(L"No files found", L"Only the folders listed in config.ini are indexed (default: Desktop, Documents, Downloads)");
+    return res;
+}
+
+struct UnitDef { const wchar_t* names; int dim; double f; };
+static const UnitDef kUnits[] = {
+    { L"mm|millimeter|millimeters", 0, 0.001 }, { L"cm|centimeter|centimeters", 0, 0.01 }, { L"m|meter|meters|metre|metres", 0, 1 },
+    { L"km|kilometer|kilometers", 0, 1000 }, { L"in|inch|inches", 0, 0.0254 }, { L"ft|foot|feet", 0, 0.3048 },
+    { L"yd|yard|yards", 0, 0.9144 }, { L"mi|mile|miles", 0, 1609.344 },
+    { L"mg", 1, 1e-6 }, { L"g|gram|grams", 1, 0.001 }, { L"kg|kilogram|kilograms|kgs", 1, 1 },
+    { L"lb|lbs|pound|pounds", 1, 0.45359237 }, { L"oz|ounce|ounces", 1, 0.028349523125 }, { L"t|tonne|tonnes", 1, 1000 },
+    { L"ml|milliliter|milliliters", 2, 0.001 }, { L"l|liter|liters|litre|litres", 2, 1 }, { L"gal|gallon|gallons", 2, 3.785411784 },
+    { L"qt|quart|quarts", 2, 0.946352946 }, { L"cup|cups", 2, 0.2365882365 }, { L"floz", 2, 0.0295735295625 },
+    { L"b|byte|bytes", 3, 1 }, { L"kb", 3, 1024 }, { L"mb", 3, 1048576 }, { L"gb", 3, 1073741824.0 }, { L"tb", 3, 1099511627776.0 },
+    { L"s|sec|second|seconds", 4, 1 }, { L"min|minute|minutes", 4, 60 }, { L"h|hr|hour|hours", 4, 3600 },
+    { L"d|day|days", 4, 86400 }, { L"wk|week|weeks", 4, 604800 },
+    { L"mps", 5, 1 }, { L"kmh|kph|kmph", 5, 1 / 3.6 }, { L"mph", 5, 0.44704 }, { L"kn|knot|knots", 5, 0.514444 },
+    { L"sqm|m2", 6, 1 }, { L"sqkm|km2", 6, 1e6 }, { L"sqft|ft2", 6, 0.09290304 }, { L"acre|acres", 6, 4046.8564224 }, { L"ha|hectare|hectares", 6, 10000 },
+    { L"c|celsius", 7, 0 }, { L"f|fahrenheit", 7, 0 }, { L"k|kelvin", 7, 0 },
+};
+static const UnitDef* FindUnit(const wstring& n) {
+    for (auto& u : kUnits)
+        for (auto& a : Split(u.names, L'|')) if (a == n) return &u;
+    return nullptr;
+}
+static bool TryConvert(const wstring& ql, wstring& out) {
+    const wchar_t* p = ql.c_str();
+    wchar_t* e = nullptr;
+    double v = wcstod(p, &e);
+    if (e == p || !std::isfinite(v)) return false;
+    while (*e == L' ') e++;
+    wstring rest = e;
+    size_t sp = rest.find(L' ');
+    if (sp == wstring::npos) return false;
+    wstring u1 = rest.substr(0, sp);
+    rest = Trim(rest.substr(sp + 1));
+    if (rest.rfind(L"to ", 0) == 0 || rest.rfind(L"in ", 0) == 0) rest = Trim(rest.substr(3)); else return false;
+    const UnitDef* a = FindUnit(u1); const UnitDef* b = FindUnit(rest);
+    if (!a || !b || a->dim != b->dim) return false;
+    double r;
+    if (a->dim == 7) {
+        wchar_t fa = a->names[0], fb = b->names[0];
+        double c = (fa == L'c') ? v : (fa == L'f') ? (v - 32) * 5 / 9 : v - 273.15;
+        r = (fb == L'c') ? c : (fb == L'f') ? c * 9 / 5 + 32 : c + 273.15;
+    } else r = v * a->f / b->f;
+    wchar_t buf[64]; swprintf(buf, 64, L"%.6g", r);
+    out = wstring(buf) + L" " + rest;
+    return true;
+}
+
+static bool TryInstant(const wstring& ql, wstring& title, wstring& sub, wstring& copy) {
+    wchar_t b[128];
+    if (ql == L"date" || ql == L"today") {
+        GetDateFormatW(LOCALE_USER_DEFAULT, DATE_LONGDATE, nullptr, nullptr, b, 128);
+        title = copy = b; sub = L"Today \u00B7 Enter copies"; return true;
+    }
+    if (ql == L"time" || ql == L"now") {
+        GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS, nullptr, nullptr, b, 128);
+        title = copy = b; sub = L"Current time \u00B7 Enter copies"; return true;
+    }
+    if (ql == L"unix" || ql == L"timestamp") {
+        FILETIME ft; GetSystemTimeAsFileTime(&ft);
+        ULONGLONG t = (((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
+        title = copy = std::to_wstring((t - 116444736000000000ULL) / 10000000ULL);
+        sub = L"Unix timestamp \u00B7 Enter copies"; return true;
+    }
+    if (ql == L"guid" || ql == L"uuid") {
+        GUID g; CoCreateGuid(&g);
+        StringFromGUID2(g, b, 64);
+        wstring s = lower(b);
+        title = copy = s.substr(1, s.size() - 2);
+        sub = L"New random GUID \u00B7 Enter copies"; return true;
+    }
+    return false;
+}
+static Item QuickItem(const wstring& title, const wstring& sub, const wstring& copy) {
+    Item it; it.cat = C_CALC; it.group = L"Quick answers"; it.glyph = DefaultGlyph(C_CALC);
+    it.title = title; it.sub = sub; it.kind = K_COPY; it.a = copy;
+    return it;
+}
+
 static Item MakeBangItem(const Bang& b, const wstring& text, Cat cat) {
     Item it;
     it.cat = cat; it.group = CatName(cat); it.glyph = DefaultGlyph(cat); it.kind = K_OPEN;
@@ -629,6 +925,34 @@ static vector<Item> RunQuery(const wstring& raw) {
         wstring trig = r2.substr(0, sp);
         for (auto& b : g_bangs)
             if (_wcsicmp(b.trig.c_str(), trig.c_str()) == 0) { res.push_back(MakeBangItem(b, Trim(r2.substr(sp + 1)), C_BANG)); return res; }
+    }
+
+    // file search: "f report"
+    if (sp != wstring::npos && sp > 0 && _wcsicmp(r2.substr(0, sp).c_str(), g_fileTrigger.c_str()) == 0)
+        return FileQuery(Trim(r2.substr(sp + 1)));
+
+    // run box: "> notepad C:\\file.txt"
+    if (q[0] == L'>') {
+        wstring cl = Trim(q.substr(1)), file, args;
+        if (!cl.empty()) {
+            if (cl[0] == L'"') {
+                size_t e = cl.find(L'"', 1);
+                if (e == wstring::npos) { file = cl.substr(1); } else { file = cl.substr(1, e - 1); args = Trim(cl.substr(e + 1)); }
+            } else {
+                size_t s2 = cl.find(L' ');
+                if (s2 == wstring::npos) file = cl; else { file = cl.substr(0, s2); args = Trim(cl.substr(s2 + 1)); }
+            }
+            Item it; it.cat = C_OPEN; it.group = L"Run"; it.glyph = 0xE756;
+            it.title = L"Run: " + cl; it.sub = L"Like the Windows Run box"; it.kind = K_OPEN; it.a = file; it.b = args;
+            res.push_back(it);
+            return res;
+        }
+    }
+
+    {   // quick answers: dates, GUIDs, unit conversion
+        wstring ql0 = lower(q), t, sb, cp;
+        if (TryInstant(ql0, t, sb, cp)) res.push_back(QuickItem(t, sb, cp));
+        if (TryConvert(ql0, cp)) res.push_back(QuickItem(L"= " + cp, L"Unit conversion \u00B7 Enter copies", cp));
     }
 
     wstring calc;
@@ -707,32 +1031,61 @@ static wstring GetClipboard() {
     CloseClipboard();
     return r;
 }
-static void OpenNotepad(const wstring& path) {
-    ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+static void OpenFile(const wstring& path) {   // opens with whatever app Windows has for it (Notepad for .ini/.txt)
+    ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
+static void Reveal(const wstring& path) {   // "show in folder"
+    PIDLIST_ABSOLUTE pidl = nullptr;
+    if (SUCCEEDED(SHParseDisplayName(path.c_str(), nullptr, &pidl, 0, nullptr)) && pidl) {
+        SHOpenFolderAndSelectItems(pidl, 0, nullptr, 0);
+        CoTaskMemFree(pidl);
+    }
+}
+static void ExitWin(UINT flags) {
+    if (flags & (EWX_POWEROFF | EWX_REBOOT)) {
+        HANDLE tok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+            TOKEN_PRIVILEGES tp = {};
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            if (LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid))
+                AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
+            CloseHandle(tok);
+        }
+    }
+    ExitWindowsEx(flags, SHTDN_REASON_MAJOR_OTHER);
+}
+static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon = NIIF_INFO);
 
 static void Exec(const Item& it) {
     if (it.confirm && MessageBoxW(nullptr, (it.title + L"?").c_str(), L"Quick Palette", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) != IDYES) return;
     switch (it.kind) {
         case K_OPEN:
-            ShellExecuteW(nullptr, L"open", ExpandEnv(it.a).c_str(), it.b.empty() ? nullptr : ExpandEnv(it.b).c_str(), nullptr, it.hide ? SW_HIDE : SW_SHOWNORMAL);
+            ShellExecuteW(nullptr, L"open", ExpandEnv(it.a).c_str(), it.b.empty() ? nullptr : ExpandEnv(it.b).c_str(), nullptr, SW_SHOWNORMAL);
             break;
         case K_APP:
             if (it.a.rfind(L"lnk:", 0) == 0) ShellExecuteW(nullptr, L"open", it.a.c_str() + 4, nullptr, nullptr, SW_SHOWNORMAL);
-            else ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"shell:AppsFolder\\" + it.a).c_str(), nullptr, SW_SHOWNORMAL);
+            else ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + it.a).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
             break;
         case K_LOCK: LockWorkStation(); break;
+        case K_SLEEP: SetSuspendState(FALSE, FALSE, FALSE); break;
+        case K_SHUTDOWN: ExitWin(EWX_POWEROFF); break;
+        case K_RESTART: ExitWin(EWX_REBOOT); break;
+        case K_LOGOFF: ExitWin(EWX_LOGOFF); break;
         case K_RECYCLE: SHEmptyRecycleBinW(nullptr, nullptr, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND); break;
         case K_QUIT: DestroyWindow(g_hwnd); break;
-        case K_EDITCFG: OpenNotepad(g_cfgPath); break;
+        case K_EDITCFG: OpenFile(g_cfgPath); break;
         case K_RELOAD: StartAppsThread(); break;
+        case K_REINDEX: StartFilesThread(); break;
         case K_UNHIDE: g_hidden.clear(); DeleteFileW(g_hiddenPath.c_str()); break;
         case K_EDITHIDDEN:
             if (!PathFileExistsW(g_hiddenPath.c_str())) WriteText(g_hiddenPath, L"");
-            OpenNotepad(g_hiddenPath);
+            OpenFile(g_hiddenPath);
             break;
         case K_COPY: SetClipboard(it.a); break;
-        case K_CFGDIR: ShellExecuteW(nullptr, L"open", L"explorer.exe", (L"\"" + g_dir + L"\"").c_str(), nullptr, SW_SHOWNORMAL); break;
+        case K_CFGDIR: OpenFile(g_dir); break;
+        case K_STARTUP_ON: SetConfigValue(L"startup", L"1"); Balloon(L"Quick Palette", L"Will start with Windows (delayed, low priority)."); break;
+        case K_STARTUP_OFF: SetConfigValue(L"startup", L"0"); Balloon(L"Quick Palette", L"Will no longer start with Windows."); break;
         default: break;
     }
 }
@@ -858,7 +1211,7 @@ static void Draw(HDC dc, int W, int H) {
     wchar_t g[2] = { 0xE721, 0 };
     Text(dc, g_fIcon, RGB(150, 150, 158), g, { px(20), 0, px(48), px(60) }, DT_VCENTER);
     RECT qr = { px(52), 0, W - px(20), px(60) };
-    if (g_query.empty()) Text(dc, g_fSearch, RGB(105, 105, 112), L"Search apps, settings, commands\u2026   try: g cats  |  yt lofi", qr, DT_VCENTER);
+    if (g_query.empty()) Text(dc, g_fSearch, RGB(105, 105, 112), L"Search apps, settings\u2026   try: f report  |  g cats  |  10 km to mi", qr, DT_VCENTER);
     else Text(dc, g_fSearch, RGB(245, 245, 247), g_query, qr, DT_VCENTER);
 
     if (g_rows.empty()) return;
@@ -903,21 +1256,19 @@ static void Draw(HDC dc, int W, int H) {
     HBRUSH fb = CreateSolidBrush(RGB(26, 26, 30));
     FillRect(dc, &fr, fb);
     DeleteObject(fb);
-    Text(dc, g_fSub, RGB(110, 110, 118), L"\u21B5 Open      \u2191\u2193 Move      Ctrl+H Hide item      Esc Close", { px(20), fy, W - px(20), H - 1 }, DT_VCENTER);
+    Text(dc, g_fSub, RGB(110, 110, 118), L"\u21B5 Open      Ctrl+\u21B5 Show in folder      Ctrl+H Hide item      Esc Close", { px(20), fy, W - px(20), H - 1 }, DT_VCENTER);
 }
 
 // ------------------------------------------------------------------ show / hide
-static void ForceForeground(HWND h) {
-    HWND fg = GetForegroundWindow();
-    DWORD ft = fg ? GetWindowThreadProcessId(fg, nullptr) : 0, ct = GetCurrentThreadId();
-    if (ft && ft != ct) AttachThreadInput(ct, ft, TRUE);
-    SetForegroundWindow(h); BringWindowToTop(h); SetFocus(h);
-    if (ft && ft != ct) AttachThreadInput(ct, ft, FALSE);
-}
+static void ForceForeground(HWND h) { SetForegroundWindow(h); BringWindowToTop(h); SetFocus(h); }
 
 static void ShowPalette() {
     if (IsWindowVisible(g_hwnd)) return;
-    if (Stamp(g_cfgPath) != g_cfgStamp) { LoadConfig(); SyncStartup(); RegisterHotkey(); }
+    if (Stamp(g_cfgPath) != g_cfgStamp) {
+        LoadConfig(); SyncStartup(); RegisterHotkey();
+        g_filesLoaded = false; g_files.clear();
+        if (!FilesCacheFresh()) StartFilesThread();
+    }
     POINT pt; GetCursorPos(&pt);
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi = { sizeof(mi) };
@@ -974,13 +1325,14 @@ static void AddTray() {
     g_nid.cbSize = sizeof g_nid; g_nid.hWnd = g_hwnd; g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    g_nid.hIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
     wcscpy_s(g_nid.szTip, L"Quick Palette");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 }
-static void Balloon(const wchar_t* title, const wchar_t* msg) {
+static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon) {
     NOTIFYICONDATAW n = g_nid;
-    n.uFlags = NIF_INFO; n.dwInfoFlags = NIIF_WARNING;
+    n.uFlags = NIF_INFO; n.dwInfoFlags = icon;
     wcscpy_s(n.szInfoTitle, title); wcscpy_s(n.szInfo, msg);
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
@@ -997,7 +1349,7 @@ static void TrayMenu() {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     if (c == 1) ShowPalette();
-    else if (c == 2) OpenNotepad(g_cfgPath);
+    else if (c == 2) OpenFile(g_cfgPath);
     else if (c == 3) StartAppsThread();
     else if (c == 4) DestroyWindow(g_hwnd);
 }
@@ -1016,6 +1368,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (IsWindowVisible(h)) { Refresh(); }
             return 0;
         }
+        case WM_FILES_READY: {
+            auto* v = (vector<wstring>*)lp;
+            g_files = std::move(*v); delete v;
+            g_filesLoaded = true;
+            return 0;
+        }
         case WM_TRAY:
             if (LOWORD(lp) == WM_LBUTTONUP) ShowPalette();
             else if (LOWORD(lp) == WM_RBUTTONUP) TrayMenu();
@@ -1027,6 +1385,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 FILETIME now; GetSystemTimeAsFileTime(&now);
                 ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime, s = Stamp(g_appsPath);
                 if (s == 0 || n - s > 864000000000ULL) StartAppsThread();   // older than 24h
+                if (!FilesCacheFresh()) StartFilesThread();
                 SetTimer(h, T_TRIM, 1500, nullptr);
             } else if (wp == T_TRIM) {
                 KillTimer(h, T_TRIM);
@@ -1070,7 +1429,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 case VK_DOWN: Move(1); return 0;
                 case VK_UP: Move(-1); return 0;
                 case VK_TAB: Move(shift ? -1 : 1); return 0;
-                case VK_RETURN: RunSelected(); return 0;
+                case VK_RETURN:
+                    if (ctrl && g_sel >= 0 && g_sel < (int)g_results.size() && !g_results[g_sel].alt.empty()) {
+                        wstring p = g_results[g_sel].alt;
+                        HidePalette();
+                        Reveal(p);
+                    } else RunSelected();
+                    return 0;
                 case VK_BACK:
                     if (g_caret > 0) {
                         if (ctrl) {
@@ -1161,7 +1526,7 @@ static LONG WINAPI OnCrash(EXCEPTION_POINTERS* e) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_inst = inst;
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     // paths
     PWSTR roam = nullptr;
@@ -1172,6 +1537,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_usagePath = g_dir + L"\\usage.txt";
     g_hiddenPath = g_dir + L"\\hidden.txt";
     g_appsPath = g_dir + L"\\apps.txt";
+    g_filesPath = g_dir + L"\\files.txt";
     SetUnhandledExceptionFilter(OnCrash);
 
     // one instance; launching again just opens the palette
@@ -1194,6 +1560,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
 
@@ -1205,7 +1573,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_wmTaskbar = RegisterWindowMessageW(L"TaskbarCreated");
     AddTray();
     if (!RegisterHotkey())
-        Balloon(L"Quick Palette", L"The shortcut in config.ini is invalid or used by another app. Edit it via the tray icon > Edit settings.");
+        Balloon(L"Quick Palette", L"The shortcut in config.ini is invalid or used by another app. Edit it via the tray icon > Edit settings.", NIIF_WARNING);
+
+    if (g_firstRun) {   // ask once, explicitly - nothing is added to startup without a Yes
+        int r = MessageBoxW(nullptr,
+            L"Start Quick Palette automatically when Windows starts?\n\nIt waits about 45 seconds and runs at low priority, so it will not slow your startup. "
+            L"You can change this any time: type \"start with windows\" in the palette.",
+            L"Quick Palette", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
+        SetConfigValue(L"startup", r == IDYES ? L"1" : L"0");
+    }
 
     // heavy work waits: 45 s after boot, 2.5 s after a manual start
     SetTimer(g_hwnd, T_BOOT, g_boot ? 45000 : 2500, nullptr);
