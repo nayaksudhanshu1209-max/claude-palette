@@ -14,6 +14,10 @@
 #include <dwmapi.h>
 #include <shellscalingapi.h>
 #include <powrprof.h>
+#include <uxtheme.h>
+#include <cstdint>
+#include <string_view>
+#include <unordered_map>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -32,6 +36,7 @@
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "uxtheme.lib")
 
 using std::wstring;
 using std::vector;
@@ -39,7 +44,7 @@ using std::vector;
 // ------------------------------------------------------------------ types
 enum Cat { C_APP, C_SET, C_CMD, C_CALC, C_OPEN, C_WEB, C_BANG, C_FILE, C_SNIP, C_COUNT };
 enum Kind { K_NONE, K_OPEN, K_APP, K_LOCK, K_RECYCLE, K_QUIT, K_EDITCFG, K_RELOAD, K_UNHIDE, K_EDITHIDDEN, K_COPY, K_CFGDIR,
-            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX };
+            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX, K_NOTE };
 
 struct Item {
     wstring id, title, sub, tl, kl, group;
@@ -62,7 +67,7 @@ static HWND g_hwnd;
 static const wchar_t* kClass = L"QuickPaletteWnd";
 static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3, WM_FILES_READY = WM_APP + 4;
 static UINT g_wmTaskbar;
-enum { T_BOOT = 1, T_TRIM = 2 };
+enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_PREVIEW = 4, T_FREE = 5 };
 
 static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath, g_filesPath;
 static wstring g_hotkey = L"Ctrl+Space", g_defaultBang = L"g";
@@ -74,9 +79,23 @@ static vector<CustomCmd> g_cmds;
 static vector<Snippet> g_snippets;
 static vector<wstring> g_folders;
 static wstring g_fileTrigger = L"f";
-static int g_fileDepth = 6, g_fileMax = 50000;
+static int g_fileDepth = 0, g_fileMax = 100000;   // depth 0 = unlimited
 static bool g_firstRun = false;
-static vector<wstring> g_files;
+struct FilePool {   // all indexed paths in ONE buffer (much lighter than a vector of strings)
+    wstring buf; vector<uint32_t> off;
+    std::wstring_view at(size_t i) const {
+        size_t st = off[i], e = (i + 1 < off.size()) ? off[i + 1] - 1 : buf.size() - 1;
+        return std::wstring_view(buf.data() + st, e - st);
+    }
+};
+static FilePool g_files;
+struct NoteDef { wstring trig, name, path; };
+static vector<NoteDef> g_notes;
+static bool g_compact = false, g_showRecent = true, g_atCursor = false, g_hideOnFocusLoss = true, g_showFooter = true, g_fileHidden = false;
+static int g_recentCount = 6, g_width = 640, g_listMax = 430, g_appsLimit = 6, g_otherLimit = 4;
+static int g_noteFontSize = 15, g_noteW = 1000, g_noteH = 680;
+static wstring g_themeMode = L"auto", g_noteFont = L"Consolas", g_noteViewCfg = L"split";
+static wstring g_fileSkip = L"node_modules|.git|$RECYCLE.BIN|System Volume Information";
 static bool g_filesLoaded = false;
 static volatile LONG g_filesBusy = 0;
 static vector<AppEntry> g_apps;
@@ -161,6 +180,44 @@ static ULONGLONG Stamp(const wstring& p) {
     return ((ULONGLONG)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
 }
 
+static bool ReadFileUtf8(const wstring& path, wstring& out, size_t maxBytes) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || (unsigned long long)sz.QuadPart > maxBytes) { CloseHandle(h); return false; }
+    std::string b((size_t)sz.QuadPart, '\0');
+    size_t got = 0; bool ok = true;
+    while (got < b.size()) {
+        DWORD r = 0;
+        if (!ReadFile(h, &b[got], (DWORD)std::min<size_t>(b.size() - got, 1u << 24), &r, nullptr) || r == 0) { ok = false; break; }
+        got += r;
+    }
+    CloseHandle(h);
+    if (!ok) return false;
+    size_t st = (b.size() >= 3 && (unsigned char)b[0] == 0xEF && (unsigned char)b[1] == 0xBB && (unsigned char)b[2] == 0xBF) ? 3 : 0;
+    int n = MultiByteToWideChar(CP_UTF8, 0, b.data() + st, (int)(b.size() - st), nullptr, 0);
+    out.assign((size_t)n, L'\0');
+    if (n) MultiByteToWideChar(CP_UTF8, 0, b.data() + st, (int)(b.size() - st), &out[0], n);
+    return true;
+}
+static bool WriteFileUtf8(const wstring& path, const wstring& text) {   // writes a temp file, then swaps it in
+    int n = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+    std::string u((size_t)n, '\0');
+    if (n) WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), &u[0], n, nullptr, nullptr);
+    wstring tmp = path + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool ok = true; size_t off = 0;
+    while (off < u.size()) {
+        DWORD w = 0;
+        if (!WriteFile(h, u.data() + off, (DWORD)std::min<size_t>(u.size() - off, 1u << 24), &w, nullptr) || w == 0) { ok = false; break; }
+        off += w;
+    }
+    CloseHandle(h);
+    if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+    return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
 // ------------------------------------------------------------------ config
 static void DefaultConfig() {
     WriteText(g_cfgPath,
@@ -174,17 +231,46 @@ static void DefaultConfig() {
         L"# You can also type \"start with windows\" in the palette to switch this.\n"
         L"startup=0\n"
         L"\n"
-        L"# File search: type  f report  to search file and folder NAMES in the folders below.\n"
-        L"# Add as many folder= lines as you like. With none, Desktop + Documents + Downloads are used.\n"
-        L"# Only these folders are indexed (never the whole drive) so it stays light.\n"
+        L"# ---- File search: type  f report  to search file and folder NAMES --------------------\n"
+        L"# Everything inside each folder= path (all sub-folders too) is indexed. With none set,\n"
+        L"# Desktop + Documents + Downloads are used. Only these folders are indexed, never the whole drive.\n"
         L"# folder=D:\\Projects\n"
         L"# folder=%USERPROFILE%\\Pictures\n"
         L"file_trigger=f\n"
-        L"file_depth=6\n"
-        L"file_max=50000\n"
+        L"file_depth=0\n"
+        L"file_max=100000\n"
+        L"# folder names that are skipped while indexing (separate with |). Leave empty to index everything.\n"
+        L"file_skip=node_modules|.git|$RECYCLE.BIN|System Volume Information\n"
+        L"file_include_hidden=0\n"
         L"\n"
         L"# Snippets: snippet=Name|text that gets copied to the clipboard when you press Enter\n"
         L"# snippet=My email|me@example.com\n"
+        L"\n"
+        L"# ---- Notes: note=trigger|Name|path-to-markdown-file ------------------------------------\n"
+        L"# Type the trigger and a space (e.g.  n ) and the palette becomes a full Markdown note editor.\n"
+        L"# {date} in the path becomes today's date (daily notes). Relative paths live in Documents.\n"
+        L"note=n|Notes|Documents\\QuickNotes.md\n"
+        L"# note=j|Journal|D:\\Journal\\{date}.md\n"
+        L"note_view=split\n"
+        L"note_font=Consolas\n"
+        L"note_font_size=15\n"
+        L"note_width=1000\n"
+        L"note_height=680\n"
+        L"\n"
+        L"# ---- Look and behavior ------------------------------------------------------------------\n"
+        L"theme=auto\n"
+        L"compact=0\n"
+        L"width=640\n"
+        L"list_height=430\n"
+        L"show_recent=1\n"
+        L"recent_count=6\n"
+        L"show_footer=1\n"
+        L"at_cursor=0\n"
+        L"hide_on_focus_loss=1\n"
+        L"apps_limit=6\n"
+        L"other_limit=4\n"
+        L"# theme: auto (follows Windows) / dark / light.  at_cursor: open at the mouse pointer instead of screen center.\n"
+        L"# note_view: edit / split / preview.  show_recent: show your most-used items when the box is empty.\n"
         L"\n"
         L"# Trigger of the bang used by the \"Search the web\" row\n"
         L"default_bang=g\n"
@@ -213,7 +299,7 @@ static void LoadConfig() {
     if (!PathFileExistsW(g_cfgPath.c_str())) { DefaultConfig(); g_firstRun = true; }
     vector<wstring> lines;
     ReadLines(g_cfgPath, lines);
-    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear();
+    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear(); g_notes.clear();
     for (auto& raw : lines) {
         wstring l = Trim(raw);
         if (l.empty() || l[0] == L'#') continue;
@@ -225,8 +311,30 @@ static void LoadConfig() {
         else if (k == L"default_bang") g_defaultBang = v;
         else if (k == L"folder") { if (!v.empty()) g_folders.push_back(v); }
         else if (k == L"file_trigger") { if (!v.empty()) g_fileTrigger = v; }
-        else if (k == L"file_depth") g_fileDepth = std::max(1, std::min(12, _wtoi(v.c_str())));
-        else if (k == L"file_max") g_fileMax = std::max(1000, std::min(300000, _wtoi(v.c_str())));
+        else if (k == L"file_depth") g_fileDepth = std::max(0, std::min(64, _wtoi(v.c_str())));
+        else if (k == L"file_max") g_fileMax = std::max(1000, std::min(500000, _wtoi(v.c_str())));
+        else if (k == L"file_skip") g_fileSkip = v;
+        else if (k == L"file_include_hidden") g_fileHidden = (v == L"1");
+        else if (k == L"theme") g_themeMode = lower(v);
+        else if (k == L"compact") g_compact = (v == L"1");
+        else if (k == L"width") g_width = std::max(420, std::min(1200, _wtoi(v.c_str())));
+        else if (k == L"list_height") g_listMax = std::max(150, std::min(900, _wtoi(v.c_str())));
+        else if (k == L"show_recent") g_showRecent = (v != L"0");
+        else if (k == L"recent_count") g_recentCount = std::max(1, std::min(20, _wtoi(v.c_str())));
+        else if (k == L"show_footer") g_showFooter = (v != L"0");
+        else if (k == L"at_cursor") g_atCursor = (v == L"1");
+        else if (k == L"hide_on_focus_loss") g_hideOnFocusLoss = (v != L"0");
+        else if (k == L"apps_limit") g_appsLimit = std::max(1, std::min(30, _wtoi(v.c_str())));
+        else if (k == L"other_limit") g_otherLimit = std::max(1, std::min(30, _wtoi(v.c_str())));
+        else if (k == L"note_view") g_noteViewCfg = lower(v);
+        else if (k == L"note_font") { if (!v.empty()) g_noteFont = v; }
+        else if (k == L"note_font_size") g_noteFontSize = std::max(9, std::min(32, _wtoi(v.c_str())));
+        else if (k == L"note_width") g_noteW = std::max(560, std::min(2000, _wtoi(v.c_str())));
+        else if (k == L"note_height") g_noteH = std::max(360, std::min(1400, _wtoi(v.c_str())));
+        else if (k == L"note") {
+            auto p = Split(v, L'|');
+            if (p.size() >= 3 && !Trim(p[0]).empty() && !Trim(p[2]).empty()) g_notes.push_back({ Trim(p[0]), Trim(p[1]), Trim(p[2]) });
+        }
         else if (k == L"snippet") {
             size_t b = v.find(L'|');
             if (b != wstring::npos && b > 0) g_snippets.push_back({ Trim(v.substr(0, b)), Trim(v.substr(b + 1)) });
@@ -239,6 +347,7 @@ static void LoadConfig() {
             if (p.size() >= 3) g_cmds.push_back({ Trim(p[0]), Trim(p[1]), Trim(p[2]), p.size() > 3 ? Trim(p[3]) : L"" });
         }
     }
+    if (g_notes.empty()) g_notes.push_back({ L"n", L"Notes", L"Documents\\QuickNotes.md" });
     g_cfgStamp = Stamp(g_cfgPath);
     g_catalogDirty = true;
 }
@@ -481,6 +590,9 @@ static void BuildCatalog() {
     // snippets
     for (auto& sn : g_snippets) Add(v, L"snip:" + sn.name, sn.name, L"Snippet \u00B7 Enter copies it", L"", C_SNIP, 0, K_COPY, sn.text);
 
+    // notes
+    for (auto& nd : g_notes) Add(v, L"note:" + nd.trig, L"Open note: " + nd.name, nd.path, L"note notes markdown write journal", C_CMD, 0xE70F, K_NOTE, nd.trig);
+
     // apps
     for (auto& a : g_apps) Add(v, L"app:" + a.id, a.name, L"Application", L"", C_APP, 0, K_APP, a.id);
 
@@ -579,7 +691,7 @@ static vector<wstring> EffectiveFolders() {
 static wstring FolderSig() {
     wstring s = L"#";
     for (auto& f : EffectiveFolders()) s += f + L"|";
-    return s + std::to_wstring(g_fileDepth) + L"/" + std::to_wstring(g_fileMax);
+    return s + std::to_wstring(g_fileDepth) + L"/" + std::to_wstring(g_fileMax) + L"/" + g_fileSkip + L"/" + (g_fileHidden ? L"h" : L"-");
 }
 static bool FilesCacheFresh() {
     ULONGLONG st = Stamp(g_filesPath);
@@ -589,39 +701,59 @@ static bool FilesCacheFresh() {
     if (n - st > 864000000000ULL) return false;   // older than 24h
     FILE* f = nullptr;
     if (_wfopen_s(&f, g_filesPath.c_str(), L"r, ccs=UTF-8") != 0 || !f) return false;
-    wchar_t buf[4096]; wstring first;
-    if (fgetws(buf, 4096, f)) first = buf;
+    wchar_t buf[8192]; wstring first;
+    if (fgetws(buf, 8192, f)) first = buf;
     fclose(f);
     while (!first.empty() && (first.back() == L'\n' || first.back() == L'\r')) first.pop_back();
     return first == FolderSig();
 }
+static void BuildOffsets(FilePool& p) {
+    p.off.clear();
+    if (p.buf.empty()) return;
+    if (p.buf.back() != L'\n') p.buf += L'\n';
+    p.off.push_back(0);
+    for (size_t i = 0; i + 1 < p.buf.size(); i++) if (p.buf[i] == L'\n') p.off.push_back((uint32_t)(i + 1));
+}
 static void EnsureFiles() {
     if (g_filesLoaded) return;
     g_filesLoaded = true;
-    vector<wstring> ln;
-    if (!ReadLines(g_filesPath, ln) || ln.empty() || ln[0] != FolderSig()) return;
-    ln.erase(ln.begin());
-    g_files = std::move(ln);
+    wstring txt;
+    if (!ReadFileUtf8(g_filesPath, txt, 300u * 1024 * 1024)) return;
+    size_t nl = txt.find(L'\n');
+    if (nl == wstring::npos) return;
+    wstring first = txt.substr(0, nl);
+    if (first != FolderSig()) return;
+    txt.erase(0, nl + 1);
+    FilePool p; p.buf = std::move(txt);
+    BuildOffsets(p);
+    g_files = std::move(p);
 }
+static void FreeFiles() { g_files = FilePool(); g_filesLoaded = false; }
 
-struct ScanJob { vector<wstring> folders; int depth, max; wstring sig; };
+struct ScanJob { vector<wstring> folders; int depth, max; vector<wstring> skip; bool hidden; wstring sig; };
 
-static void ScanFolder(const wstring& dir, int depth, int maxDepth, int maxCount, vector<wstring>& out) {
+static void ScanFolder(const wstring& dir, int depth, const ScanJob& job, FilePool& pool) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
-        if ((int)out.size() >= maxCount) break;
+        if ((int)pool.off.size() >= job.max) break;
         const wchar_t* n = fd.cFileName;
         if (n[0] == L'.' && (n[1] == 0 || (n[1] == L'.' && n[2] == 0))) continue;
-        if (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) continue;
-        wstring full = dir + L"\\" + n;
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        if (!job.hidden && (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) continue;
+        bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        if (isDir) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;   // no junction loops
-            if (!_wcsicmp(n, L"node_modules") || !_wcsicmp(n, L".git") || !_wcsicmp(n, L"$RECYCLE.BIN") || !_wcsicmp(n, L"System Volume Information")) continue;
-            out.push_back(full + L"\\");
-            if (depth < maxDepth) ScanFolder(full, depth + 1, maxDepth, maxCount, out);
-        } else out.push_back(full);
+            bool skip = false;
+            for (auto& sk : job.skip) if (!_wcsicmp(n, sk.c_str())) { skip = true; break; }
+            if (skip) continue;
+        }
+        wstring full = dir + L"\\" + n;
+        pool.off.push_back((uint32_t)pool.buf.size());
+        pool.buf += full;
+        if (isDir) pool.buf += L'\\';
+        pool.buf += L'\n';
+        if (isDir && depth < job.depth) ScanFolder(full, depth + 1, job, pool);
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 }
@@ -629,25 +761,26 @@ static void ScanFolder(const wstring& dir, int depth, int maxDepth, int maxCount
 static DWORD WINAPI FilesThread(LPVOID param) {
     ScanJob* job = (ScanJob*)param;
     SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
-    auto* out = new vector<wstring>();
+    auto* pool = new FilePool();
     for (auto& f : job->folders) {
-        if ((int)out->size() >= job->max) break;
-        ScanFolder(f, 1, job->depth, job->max, *out);
+        if ((int)pool->off.size() >= job->max) break;
+        ScanFolder(f, 1, *job, *pool);
     }
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, g_filesPath.c_str(), L"w, ccs=UTF-8") == 0 && f) {
-        fputws((job->sig + L"\n").c_str(), f);
-        for (auto& p : *out) { fputws(p.c_str(), f); fputws(L"\n", f); }
-        fclose(f);
-    }
+    WriteFileUtf8(g_filesPath, job->sig + L"\n" + pool->buf);
     delete job;
-    PostMessageW(g_hwnd, WM_FILES_READY, 0, (LPARAM)out);
+    PostMessageW(g_hwnd, WM_FILES_READY, 0, (LPARAM)pool);
     InterlockedExchange(&g_filesBusy, 0);
     return 0;
 }
 static void StartFilesThread() {
     if (InterlockedCompareExchange(&g_filesBusy, 1, 0) != 0) return;
-    auto* job = new ScanJob{ EffectiveFolders(), g_fileDepth, g_fileMax, FolderSig() };
+    auto* job = new ScanJob();
+    job->folders = EffectiveFolders();
+    job->depth = g_fileDepth > 0 ? g_fileDepth : 64;
+    job->max = g_fileMax;
+    for (auto& p : Split(g_fileSkip, L'|')) { wstring t = Trim(p); if (!t.empty()) job->skip.push_back(t); }
+    job->hidden = g_fileHidden;
+    job->sig = FolderSig();
     HANDLE h = CreateThread(nullptr, 0, FilesThread, job, 0, nullptr);
     if (h) CloseHandle(h);
     else { delete job; InterlockedExchange(&g_filesBusy, 0); }
@@ -753,6 +886,21 @@ static bool LooksLikeUrl(const wstring& q) {
     return false;
 }
 
+static inline wchar_t LC(wchar_t c) { return c < 128 ? (c >= L'A' && c <= L'Z' ? (wchar_t)(c + 32) : c) : (wchar_t)towlower(c); }
+static bool CIContains(const wchar_t* h, size_t hn, const wstring& nd) {
+    size_t m = nd.size();
+    if (!m) return true;
+    if (hn < m) return false;
+    wchar_t f = nd[0];
+    for (size_t i = 0; i + m <= hn; i++) {
+        if (LC(h[i]) != f) continue;
+        size_t k = 1;
+        while (k < m && LC(h[i + k]) == nd[k]) k++;
+        if (k == m) return true;
+    }
+    return false;
+}
+
 static vector<Item> FileQuery(const wstring& text) {
     EnsureFiles();
     vector<Item> res;
@@ -764,41 +912,36 @@ static vector<Item> FileQuery(const wstring& text) {
         res.push_back(it);
     };
     if (toks.empty()) {
-        hint(L"Search your files", g_files.empty() ? L"Index is empty or still building \u00B7 set folder= lines in config.ini"
-                                                    : std::to_wstring(g_files.size()) + L" items indexed \u00B7 type part of a name");
+        hint(L"Search your files", g_files.off.empty() ? L"Index is empty or still building \u00B7 set folder= lines in config.ini"
+                                                        : std::to_wstring(g_files.off.size()) + L" items indexed \u00B7 type part of a name");
         return res;
     }
-    struct Sc { int idx, s; };
+    struct Sc { uint32_t idx; int s; };
     vector<Sc> c;
-    for (size_t i = 0; i < g_files.size(); i++) {
-        const wstring& p = g_files[i];
-        size_t end = p.size();
-        if (end && p[end - 1] == L'\\') end--;
-        size_t sl = end ? p.rfind(L'\\', end - 1) : wstring::npos;
-        size_t st = (sl == wstring::npos) ? 0 : sl + 1;
-        wstring name = lower(p.substr(st, end - st));
-        wstring lp; bool have = false;
-        int sum = 0; bool ok = true;
-        for (auto& t : toks) {
-            int x = ScoreOne(t, name, L"");
-            if (!x) {
-                if (!have) { lp = lower(p); have = true; }
-                if (lp.find(t) != wstring::npos) x = 15; else { ok = false; break; }
-            }
-            sum += x;
-        }
-        if (ok) c.push_back({ (int)i, sum / (int)toks.size() });
+    for (size_t i = 0; i < g_files.off.size(); i++) {
+        std::wstring_view pv = g_files.at(i);
+        bool pass = true;
+        for (auto& t : toks) if (!CIContains(pv.data(), pv.size(), t)) { pass = false; break; }
+        if (!pass) continue;
+        size_t end = pv.size();
+        if (end && pv[end - 1] == L'\\') end--;
+        size_t sl = end ? pv.rfind(L'\\', end - 1) : std::wstring_view::npos;
+        size_t st = (sl == std::wstring_view::npos) ? 0 : sl + 1;
+        wstring name = lower(wstring(pv.substr(st, end - st)));
+        int sum = 0;
+        for (auto& t : toks) { int x = ScoreOne(t, name, L""); sum += x ? x : 15; }
+        c.push_back({ (uint32_t)i, sum / (int)toks.size() });
     }
     size_t n = std::min<size_t>(c.size(), 12);
     std::partial_sort(c.begin(), c.begin() + n, c.end(), [](const Sc& a, const Sc& b) {
         if (a.s != b.s) return a.s > b.s;
-        return g_files[a.idx].size() < g_files[b.idx].size();
+        return g_files.at(a.idx).size() < g_files.at(b.idx).size();
     });
     for (size_t i = 0; i < n; i++) {
-        const wstring& p = g_files[c[i].idx];
+        wstring p(g_files.at(c[i].idx));
         bool dir = !p.empty() && p.back() == L'\\';
         size_t end = dir ? p.size() - 1 : p.size();
-        size_t sl = p.rfind(L'\\', end ? end - 1 : 0);
+        size_t sl = end ? p.rfind(L'\\', end - 1) : wstring::npos;
         size_t st = (sl == wstring::npos) ? 0 : sl + 1;
         Item it; it.cat = C_FILE; it.group = L"Files"; it.glyph = dir ? 0xE8B7 : 0xE8A5;
         it.title = p.substr(st, end - st);
@@ -910,10 +1053,11 @@ static vector<Item> RunQuery(const wstring& raw) {
     wstring q = Trim(raw);
 
     if (q.empty()) {   // most used
+        if (!g_showRecent) return res;
         vector<const Item*> f;
         for (auto& it : g_catalog) if (it.track && !g_hidden.count(it.id) && g_usage.count(it.id)) f.push_back(&it);
         std::sort(f.begin(), f.end(), [](const Item* x, const Item* y) { return g_usage[x->id] > g_usage[y->id]; });
-        for (size_t i = 0; i < f.size() && i < 6; i++) { Item c = *f[i]; c.group = L"Frequently used"; res.push_back(c); }
+        for (size_t i = 0; i < f.size() && i < (size_t)g_recentCount; i++) { Item c = *f[i]; c.group = L"Frequently used"; res.push_back(c); }
         return res;
     }
 
@@ -954,6 +1098,14 @@ static vector<Item> RunQuery(const wstring& raw) {
         if (TryInstant(ql0, t, sb, cp)) res.push_back(QuickItem(t, sb, cp));
         if (TryConvert(ql0, cp)) res.push_back(QuickItem(L"= " + cp, L"Unit conversion \u00B7 Enter copies", cp));
     }
+
+    for (auto& nd : g_notes)   // typed exactly the note trigger: offer it first
+        if (_wcsicmp(nd.trig.c_str(), q.c_str()) == 0) {
+            Item it; it.cat = C_CMD; it.group = L"Notes"; it.glyph = 0xE70F;
+            it.title = L"Open note: " + nd.name; it.sub = L"Tip: type  " + nd.trig + L" + space  to jump straight in";
+            it.kind = K_NOTE; it.a = nd.trig;
+            res.push_back(it);
+        }
 
     wstring calc;
     if (TryCalc(q, calc)) {
@@ -999,7 +1151,7 @@ static vector<Item> RunQuery(const wstring& raw) {
             if (x.s != y.s) return x.s > y.s;
             return g_catalog[x.idx].title.size() < g_catalog[y.idx].title.size();
         });
-        size_t lim = (c == C_APP) ? 6 : 4;
+        size_t lim = (c == C_APP) ? (size_t)g_appsLimit : (size_t)g_otherLimit;
         for (size_t i = 0; i < part.size() && i < lim; i++) res.push_back(g_catalog[part[i].idx]);
     }
 
@@ -1090,504 +1242,5 @@ static void Exec(const Item& it) {
     }
 }
 
-// ------------------------------------------------------------------ layout
-static int ContentH() { int h = 0; for (auto& r : g_rows) h += r.header ? px(28) : px(50); return h; }
-static int ListH() { return std::min(ContentH(), px(430)); }
-static int ListTop() { return px(60) + 1 + px(4); }
-static int TotalH() { int h = px(60); if (!g_rows.empty()) h += 1 + px(4) + ListH() + px(6) + px(28); return h; }
-
-static bool g_win11 = false;
-
-static void ApplyLayout() {
-    int w = px(640), h = TotalH();
-    SetWindowPos(g_hwnd, nullptr, 0, 0, w, h, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    if (!g_win11) SetWindowRgn(g_hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, px(14), px(14)), TRUE);
-}
-
-static void BuildRows() {
-    g_rows.clear();
-    wstring last;
-    for (size_t i = 0; i < g_results.size(); i++) {
-        if (g_results[i].group != last) { last = g_results[i].group; g_rows.push_back({ true, -1, last }); }
-        g_rows.push_back({ false, (int)i, L"" });
-    }
-}
-
-static void EnsureVisible() {
-    int cy = 0;
-    for (size_t i = 0; i < g_rows.size(); i++) {
-        int h = g_rows[i].header ? px(28) : px(50);
-        if (!g_rows[i].header && g_rows[i].idx == g_sel) {
-            int top = cy;
-            if (i > 0 && g_rows[i - 1].header) top -= px(28);
-            int bot = cy + h, lh = ListH();
-            if (top < g_scroll) g_scroll = top;
-            else if (bot > g_scroll + lh) g_scroll = bot - lh;
-            break;
-        }
-        cy += h;
-    }
-    int mx = std::max(0, ContentH() - ListH());
-    g_scroll = std::max(0, std::min(g_scroll, mx));
-}
-
-static int HitTest(int y) {
-    int lt = ListTop();
-    if (y < lt || y >= lt + ListH()) return -1;
-    int cy = lt - g_scroll;
-    for (auto& r : g_rows) {
-        int h = r.header ? px(28) : px(50);
-        if (y >= cy && y < cy + h) return r.header ? -1 : r.idx;
-        cy += h;
-    }
-    return -1;
-}
-
-static void UpdateCaret() {
-    HDC dc = GetDC(g_hwnd);
-    HGDIOBJ o = SelectObject(dc, g_fSearch);
-    SIZE sz = { 0, 0 };
-    GetTextExtentPoint32W(dc, g_query.c_str(), g_caret, &sz);
-    SelectObject(dc, o);
-    ReleaseDC(g_hwnd, dc);
-    SetCaretPos(px(52) + sz.cx, (px(60) - px(26)) / 2);
-}
-
-static void Refresh() {
-    g_results = RunQuery(g_query);
-    BuildRows();
-    g_sel = g_results.empty() ? -1 : 0;
-    g_hover = -1; g_scroll = 0;
-    ApplyLayout();
-    InvalidateRect(g_hwnd, nullptr, FALSE);
-}
-
-// ------------------------------------------------------------------ fonts + drawing
-static HFONT MakeFont(int h, int weight, const wchar_t* face) {
-    return CreateFontW(-h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
-}
-static void SetDpi(int dpi) {
-    if (dpi == g_dpi && g_fTitle) return;
-    g_dpi = dpi;
-    for (HFONT* f : { &g_fSearch, &g_fTitle, &g_fSub, &g_fHdr, &g_fIcon }) if (*f) { DeleteObject(*f); *f = nullptr; }
-    g_fSearch = MakeFont(px(22), 400, L"Segoe UI");
-    g_fTitle = MakeFont(px(15), 400, L"Segoe UI");
-    g_fSub = MakeFont(px(12), 400, L"Segoe UI");
-    g_fHdr = MakeFont(px(12), 600, L"Segoe UI");
-    g_fIcon = MakeFont(px(17), 400, L"Segoe MDL2 Assets");
-}
-
-static COLORREF Mix(COLORREF a, COLORREF b, int pct) {   // pct of b
-    return RGB(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * pct / 100,
-               GetGValue(a) + (GetGValue(b) - GetGValue(a)) * pct / 100,
-               GetBValue(a) + (GetBValue(b) - GetBValue(a)) * pct / 100);
-}
-static void FillRound(HDC dc, RECT r, COLORREF c, int rad) {
-    HBRUSH b = CreateSolidBrush(c);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, GetStockObject(NULL_PEN));
-    RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, rad, rad);
-    SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(b);
-}
-static void Text(HDC dc, HFONT f, COLORREF c, const wstring& s, RECT r, UINT flags = DT_LEFT) {
-    SelectObject(dc, f);
-    SetTextColor(dc, c);
-    DrawTextW(dc, s.c_str(), (int)s.size(), &r, flags | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-}
-
-static const COLORREF BG = RGB(31, 31, 35), BORDER = RGB(64, 64, 70), DIM = RGB(130, 130, 138);
-
-static void Draw(HDC dc, int W, int H) {
-    HBRUSH bg = CreateSolidBrush(BG);
-    RECT all = { 0, 0, W, H };
-    FillRect(dc, &all, bg);
-    DeleteObject(bg);
-    HBRUSH bd = CreateSolidBrush(BORDER);
-    FrameRect(dc, &all, bd);
-    DeleteObject(bd);
-    SetBkMode(dc, TRANSPARENT);
-
-    // search row
-    wchar_t g[2] = { 0xE721, 0 };
-    Text(dc, g_fIcon, RGB(150, 150, 158), g, { px(20), 0, px(48), px(60) }, DT_VCENTER);
-    RECT qr = { px(52), 0, W - px(20), px(60) };
-    if (g_query.empty()) Text(dc, g_fSearch, RGB(105, 105, 112), L"Search apps, settings\u2026   try: f report  |  g cats  |  10 km to mi", qr, DT_VCENTER);
-    else Text(dc, g_fSearch, RGB(245, 245, 247), g_query, qr, DT_VCENTER);
-
-    if (g_rows.empty()) return;
-
-    HBRUSH ln = CreateSolidBrush(RGB(52, 52, 58));
-    RECT lr = { 1, px(60), W - 1, px(60) + 1 };
-    FillRect(dc, &lr, ln);
-    DeleteObject(ln);
-
-    int lt = ListTop(), lh = ListH();
-    int sc = SaveDC(dc);
-    IntersectClipRect(dc, 0, lt, W, lt + lh);
-    int y = lt - g_scroll;
-    for (auto& r : g_rows) {
-        int h = r.header ? px(28) : px(50);
-        if (y + h > lt && y < lt + lh) {
-            if (r.header) {
-                Text(dc, g_fHdr, RGB(140, 140, 148), r.text, { px(22), y + px(8), W - px(20), y + h }, 0);
-            } else {
-                const Item& it = g_results[r.idx];
-                RECT rr = { px(8), y + px(1), W - px(8), y + h - px(1) };
-                if (r.idx == g_sel) FillRound(dc, rr, RGB(62, 62, 69), px(8));
-                else if (r.idx == g_hover) FillRound(dc, rr, RGB(46, 46, 52), px(8));
-                COLORREF ac = Accent(it.cat);
-                int ts = px(34);
-                RECT tile = { px(18), y + (h - ts) / 2, px(18) + ts, y + (h - ts) / 2 + ts };
-                FillRound(dc, tile, Mix(r.idx == g_sel ? RGB(62, 62, 69) : BG, ac, 24), px(9));
-                wchar_t gl[2] = { it.glyph, 0 };
-                Text(dc, g_fIcon, ac, gl, tile, DT_CENTER | DT_VCENTER);
-                int tx = tile.right + px(12);
-                Text(dc, g_fTitle, RGB(245, 245, 247), it.title, { tx, y + px(7), W - px(20), y + px(27) }, 0);
-                Text(dc, g_fSub, DIM, it.sub, { tx, y + px(27), W - px(20), y + px(45) }, 0);
-            }
-        }
-        y += h;
-    }
-    RestoreDC(dc, sc);
-
-    // footer
-    int fy = lt + lh + px(6);
-    RECT fr = { 1, fy, W - 1, H - 1 };
-    HBRUSH fb = CreateSolidBrush(RGB(26, 26, 30));
-    FillRect(dc, &fr, fb);
-    DeleteObject(fb);
-    Text(dc, g_fSub, RGB(110, 110, 118), L"\u21B5 Open      Ctrl+\u21B5 Show in folder      Ctrl+H Hide item      Esc Close", { px(20), fy, W - px(20), H - 1 }, DT_VCENTER);
-}
-
-// ------------------------------------------------------------------ show / hide
-static void ForceForeground(HWND h) { SetForegroundWindow(h); BringWindowToTop(h); SetFocus(h); }
-
-static void ShowPalette() {
-    if (IsWindowVisible(g_hwnd)) return;
-    if (Stamp(g_cfgPath) != g_cfgStamp) {
-        LoadConfig(); SyncStartup(); RegisterHotkey();
-        g_filesLoaded = false; g_files.clear();
-        if (!FilesCacheFresh()) StartFilesThread();
-    }
-    POINT pt; GetCursorPos(&pt);
-    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
-    MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfoW(mon, &mi);
-    UINT dx = 96, dy = 96;
-    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
-    SetDpi((int)dx);
-    g_query.clear(); g_caret = 0;
-    Refresh();
-    int w = px(640);
-    int x = mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - w) / 2;
-    int y = mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top) * 16 / 100;
-    SetWindowPos(g_hwnd, HWND_TOPMOST, x, y, w, TotalH(), SWP_SHOWWINDOW);
-    ForceForeground(g_hwnd);
-}
-
-static void HidePalette() {
-    if (!IsWindowVisible(g_hwnd)) return;
-    ShowWindow(g_hwnd, SW_HIDE);
-    SetTimer(g_hwnd, T_TRIM, 800, nullptr);   // give memory back shortly after
-}
-
-static void RunSelected() {
-    if (g_sel < 0 || g_sel >= (int)g_results.size()) return;
-    Item it = g_results[g_sel];
-    HidePalette();
-    if (it.track) { g_usage[it.id]++; SaveUsage(); }
-    Exec(it);
-}
-
-static void HideIndex(int i) {
-    if (i < 0 || i >= (int)g_results.size() || !g_results[i].track) return;
-    const Item& it = g_results[i];
-    g_hidden[it.id] = it.title;
-    WriteText(g_hiddenPath, it.id + L"\t" + it.title + L"\n", L"a, ccs=UTF-8");
-    int keep = g_sel;
-    Refresh();
-    if (!g_results.empty()) { g_sel = std::min(keep, (int)g_results.size() - 1); EnsureVisible(); }
-}
-
-static void Move(int d) {
-    int n = (int)g_results.size();
-    if (!n) return;
-    g_sel = (g_sel + d + n) % n;
-    EnsureVisible();
-    InvalidateRect(g_hwnd, nullptr, FALSE);
-}
-
-static void QueryChanged() { Refresh(); UpdateCaret(); }
-
-// ------------------------------------------------------------------ tray
-static void AddTray() {
-    ZeroMemory(&g_nid, sizeof g_nid);
-    g_nid.cbSize = sizeof g_nid; g_nid.hWnd = g_hwnd; g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAY;
-    g_nid.hIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-    if (!g_nid.hIcon) g_nid.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(g_nid.szTip, L"Quick Palette");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-}
-static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon) {
-    NOTIFYICONDATAW n = g_nid;
-    n.uFlags = NIF_INFO; n.dwInfoFlags = icon;
-    wcscpy_s(n.szInfoTitle, title); wcscpy_s(n.szInfo, msg);
-    Shell_NotifyIconW(NIM_MODIFY, &n);
-}
-static void TrayMenu() {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, 1, L"Open palette");
-    AppendMenuW(m, MF_STRING, 2, L"Edit settings");
-    AppendMenuW(m, MF_STRING, 3, L"Reload app list");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, 4, L"Quit");
-    POINT p; GetCursorPos(&p);
-    SetForegroundWindow(g_hwnd);
-    int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, g_hwnd, nullptr);
-    PostMessageW(g_hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
-    if (c == 1) ShowPalette();
-    else if (c == 2) OpenFile(g_cfgPath);
-    else if (c == 3) StartAppsThread();
-    else if (c == 4) DestroyWindow(g_hwnd);
-}
-
-// ------------------------------------------------------------------ window procedure
-static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
-    switch (msg) {
-        case WM_HOTKEY:
-            if (IsWindowVisible(h)) HidePalette(); else ShowPalette();
-            return 0;
-        case WM_SHOWME: ShowPalette(); return 0;
-        case WM_APPS_READY: {
-            auto* v = (vector<AppEntry>*)lp;
-            g_apps = std::move(*v); delete v;
-            g_appsLoaded = true; g_catalogDirty = true;
-            if (IsWindowVisible(h)) { Refresh(); }
-            return 0;
-        }
-        case WM_FILES_READY: {
-            auto* v = (vector<wstring>*)lp;
-            g_files = std::move(*v); delete v;
-            g_filesLoaded = true;
-            return 0;
-        }
-        case WM_TRAY:
-            if (LOWORD(lp) == WM_LBUTTONUP) ShowPalette();
-            else if (LOWORD(lp) == WM_RBUTTONUP) TrayMenu();
-            return 0;
-        case WM_TIMER:
-            if (wp == T_BOOT) {
-                KillTimer(h, T_BOOT);
-                if (g_boot) SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_END);
-                FILETIME now; GetSystemTimeAsFileTime(&now);
-                ULONGLONG n = ((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime, s = Stamp(g_appsPath);
-                if (s == 0 || n - s > 864000000000ULL) StartAppsThread();   // older than 24h
-                if (!FilesCacheFresh()) StartFilesThread();
-                SetTimer(h, T_TRIM, 1500, nullptr);
-            } else if (wp == T_TRIM) {
-                KillTimer(h, T_TRIM);
-                if (!IsWindowVisible(h)) SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-            }
-            return 0;
-        case WM_ACTIVATE:
-            if (LOWORD(wp) == WA_INACTIVE && !g_menuOpen) HidePalette();
-            return 0;
-        case WM_SETFOCUS:
-            CreateCaret(h, nullptr, px(2), px(26));
-            UpdateCaret();
-            ShowCaret(h);
-            return 0;
-        case WM_KILLFOCUS: DestroyCaret(); return 0;
-        case WM_ERASEBKGND: return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT ps;
-            HDC dc = BeginPaint(h, &ps);
-            RECT rc; GetClientRect(h, &rc);
-            HideCaret(h);
-            HDC m = CreateCompatibleDC(dc);
-            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-            HGDIOBJ old = SelectObject(m, bmp);
-            Draw(m, rc.right, rc.bottom);
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
-            SelectObject(m, old); DeleteObject(bmp); DeleteDC(m);
-            ShowCaret(h);
-            EndPaint(h, &ps);
-            return 0;
-        }
-        case WM_CHAR: {
-            wchar_t c = (wchar_t)wp;
-            if (c >= 32 && c != 127) { g_query.insert(g_caret, 1, c); g_caret++; QueryChanged(); }
-            return 0;
-        }
-        case WM_KEYDOWN: {
-            bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
-            switch (wp) {
-                case VK_ESCAPE: HidePalette(); return 0;
-                case VK_DOWN: Move(1); return 0;
-                case VK_UP: Move(-1); return 0;
-                case VK_TAB: Move(shift ? -1 : 1); return 0;
-                case VK_RETURN:
-                    if (ctrl && g_sel >= 0 && g_sel < (int)g_results.size() && !g_results[g_sel].alt.empty()) {
-                        wstring p = g_results[g_sel].alt;
-                        HidePalette();
-                        Reveal(p);
-                    } else RunSelected();
-                    return 0;
-                case VK_BACK:
-                    if (g_caret > 0) {
-                        if (ctrl) {
-                            int s = g_caret;
-                            while (s > 0 && g_query[s - 1] == L' ') s--;
-                            while (s > 0 && g_query[s - 1] != L' ') s--;
-                            g_query.erase(s, g_caret - s); g_caret = s;
-                        } else g_query.erase(--g_caret, 1);
-                        QueryChanged();
-                    }
-                    return 0;
-                case VK_DELETE:
-                    if (g_caret < (int)g_query.size()) { g_query.erase(g_caret, 1); QueryChanged(); }
-                    return 0;
-                case VK_LEFT: if (g_caret > 0) { g_caret--; UpdateCaret(); } return 0;
-                case VK_RIGHT: if (g_caret < (int)g_query.size()) { g_caret++; UpdateCaret(); } return 0;
-                case VK_HOME: g_caret = 0; UpdateCaret(); return 0;
-                case VK_END: g_caret = (int)g_query.size(); UpdateCaret(); return 0;
-                case 'H': if (ctrl) { HideIndex(g_sel); return 0; } break;
-                case 'V':
-                    if (ctrl) {
-                        wstring t = GetClipboard();
-                        for (auto& c : t) if (c < 32) c = L' ';
-                        if (!t.empty()) { g_query.insert(g_caret, t); g_caret += (int)t.size(); QueryChanged(); }
-                        return 0;
-                    }
-                    break;
-            }
-            break;
-        }
-        case WM_MOUSEMOVE: {
-            int i = HitTest(GET_Y_LPARAM(lp));
-            if (i != g_hover) { g_hover = i; InvalidateRect(h, nullptr, FALSE); }
-            TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, h, 0 };
-            TrackMouseEvent(&t);
-            return 0;
-        }
-        case WM_MOUSELEAVE:
-            if (g_hover != -1) { g_hover = -1; InvalidateRect(h, nullptr, FALSE); }
-            return 0;
-        case WM_MOUSEWHEEL: {
-            g_scroll -= GET_WHEEL_DELTA_WPARAM(wp) * px(50) / WHEEL_DELTA;
-            int mx = std::max(0, ContentH() - ListH());
-            g_scroll = std::max(0, std::min(g_scroll, mx));
-            InvalidateRect(h, nullptr, FALSE);
-            return 0;
-        }
-        case WM_LBUTTONUP: {
-            int i = HitTest(GET_Y_LPARAM(lp));
-            if (i >= 0) { g_sel = i; RunSelected(); }
-            return 0;
-        }
-        case WM_RBUTTONUP: {
-            int i = HitTest(GET_Y_LPARAM(lp));
-            if (i >= 0 && g_results[i].track) {
-                g_menuOpen = true;
-                HMENU m = CreatePopupMenu();
-                AppendMenuW(m, MF_STRING, 1, L"Hide from suggestions");
-                POINT p; GetCursorPos(&p);
-                int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, p.x, p.y, 0, h, nullptr);
-                DestroyMenu(m);
-                g_menuOpen = false;
-                if (c == 1) HideIndex(i);
-                SetFocus(h);
-            }
-            return 0;
-        }
-        case WM_DESTROY:
-            Shell_NotifyIconW(NIM_DELETE, &g_nid);
-            UnregisterHotKey(h, 1);
-            PostQuitMessage(0);
-            return 0;
-        default:
-            if (msg == g_wmTaskbar && g_wmTaskbar) { AddTray(); return 0; }
-    }
-    return DefWindowProcW(h, msg, wp, lp);
-}
-
-// ------------------------------------------------------------------ entry
-static LONG WINAPI OnCrash(EXCEPTION_POINTERS* e) {
-    FILE* f = nullptr;
-    if (_wfopen_s(&f, (g_dir + L"\\crash.log").c_str(), L"a") == 0 && f) {
-        fprintf(f, "crash code=0x%08lX addr=%p\n", e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress);
-        fclose(f);
-    }
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
-    g_inst = inst;
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-
-    // paths
-    PWSTR roam = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roam))) { g_dir = wstring(roam) + L"\\QuickPalette"; CoTaskMemFree(roam); }
-    else g_dir = L".";
-    CreateDirectoryW(g_dir.c_str(), nullptr);
-    g_cfgPath = g_dir + L"\\config.ini";
-    g_usagePath = g_dir + L"\\usage.txt";
-    g_hiddenPath = g_dir + L"\\hidden.txt";
-    g_appsPath = g_dir + L"\\apps.txt";
-    g_filesPath = g_dir + L"\\files.txt";
-    SetUnhandledExceptionFilter(OnCrash);
-
-    // one instance; launching again just opens the palette
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\QuickPalette.v2");
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND w = FindWindowW(kClass, nullptr);
-        if (w) PostMessageW(w, WM_SHOWME, 0, 0);
-        return 0;
-    }
-
-    g_boot = cmd && wcsstr(cmd, L"--boot") != nullptr;
-    if (g_boot) SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN);   // low CPU + low disk priority while Windows boots
-
-    LoadConfig();
-    SyncStartup();
-    SetDpi(96);
-
-    WNDCLASSEXW wc = { sizeof wc };
-    wc.style = CS_DROPSHADOW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = inst;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
-    wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
-    wc.lpszClassName = kClass;
-    RegisterClassExW(&wc);
-
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClass, L"Quick Palette", WS_POPUP, 0, 0, px(640), px(60), nullptr, nullptr, inst, nullptr);
-    if (!g_hwnd) return 1;
-    int pref = 2;   // rounded corners (only succeeds on Windows 11)
-    g_win11 = SUCCEEDED(DwmSetWindowAttribute(g_hwnd, 33, &pref, sizeof pref));
-
-    g_wmTaskbar = RegisterWindowMessageW(L"TaskbarCreated");
-    AddTray();
-    if (!RegisterHotkey())
-        Balloon(L"Quick Palette", L"The shortcut in config.ini is invalid or used by another app. Edit it via the tray icon > Edit settings.", NIIF_WARNING);
-
-    if (g_firstRun) {   // ask once, explicitly - nothing is added to startup without a Yes
-        int r = MessageBoxW(nullptr,
-            L"Start Quick Palette automatically when Windows starts?\n\nIt waits about 45 seconds and runs at low priority, so it will not slow your startup. "
-            L"You can change this any time: type \"start with windows\" in the palette.",
-            L"Quick Palette", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST);
-        SetConfigValue(L"startup", r == IDYES ? L"1" : L"0");
-    }
-
-    // heavy work waits: 45 s after boot, 2.5 s after a manual start
-    SetTimer(g_hwnd, T_BOOT, g_boot ? 45000 : 2500, nullptr);
-
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
-    if (mtx) CloseHandle(mtx);
-    return 0;
-}
+#include "md.h"
+#include "ui.h"
