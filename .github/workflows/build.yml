@@ -13,10 +13,19 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1
 
-      # Static runtime (/MT): the exe needs NOTHING installed on your PC.
+      - name: Compile resources (icon, version info, manifest)
+        shell: cmd
+        run: rc /nologo app.rc
+
+      # Static runtime (/MT): nothing needs to be installed on your PC.
+      # Control Flow Guard + ASLR + DEP are on (standard Windows hardening).
       - name: Compile
         shell: cmd
-        run: cl /nologo /utf-8 /std:c++17 /O1 /GL /MT /EHsc /DUNICODE /D_UNICODE main.cpp /Fe:QuickPalette.exe /link /SUBSYSTEM:WINDOWS /OPT:REF /OPT:ICF /LTCG
+        run: cl /nologo /utf-8 /std:c++17 /O1 /GL /MT /EHsc /guard:cf /DUNICODE /D_UNICODE main.cpp app.res /Fe:QuickPalette.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /OPT:REF /OPT:ICF /LTCG /GUARD:CF /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA
+
+      - name: SHA-256 of the exe
+        shell: pwsh
+        run: Get-FileHash QuickPalette.exe -Algorithm SHA256 | Format-List
 
       - uses: actions/upload-artifact@v4
         with:
