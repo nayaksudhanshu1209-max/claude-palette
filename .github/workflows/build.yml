@@ -6,7 +6,40 @@ on:
   workflow_dispatch:
 
 jobs:
+  build:name: Build QuickPalette
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
   build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile resources (icon, version info, manifest)
+        shell: cmd
+        run: rc /nologo app.rc
+
+      # Static runtime (/MT): nothing needs to be installed on your PC.
+      # Control Flow Guard + ASLR + DEP are on (standard Windows hardening).
+      - name: Compile
+        shell: cmd
+        run: cl /nologo /utf-8 /std:c++17 /O1 /GL /MT /EHsc /guard:cf /DUNICODE /D_UNICODE main.cpp app.res /Fe:QuickPalette.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /OPT:REF /OPT:ICF /LTCG /GUARD:CF /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA
+
+      - name: SHA-256 of the exe
+        shell: pwsh
+        run: Get-FileHash QuickPalette.exe -Algorithm SHA256 | Format-List
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QuickPalette
+          path: QuickPalette.exe
+
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
