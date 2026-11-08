@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <cwctype>
 #include <cmath>
 #include <cstdio>
@@ -37,6 +38,15 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "uxtheme.lib")
+#if __has_include(<WebView2.h>)   // only when the build step could fetch Microsoft's WebView2 SDK
+#include <wrl.h>
+#include <WebView2.h>
+#include <WebView2EnvironmentOptions.h>
+#define QP_WEBVIEW 1
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "runtimeobject.lib")
+#endif
 
 using std::wstring;
 using std::vector;
@@ -44,7 +54,7 @@ using std::vector;
 // ------------------------------------------------------------------ types
 enum Cat { C_APP, C_SET, C_CMD, C_CALC, C_OPEN, C_WEB, C_BANG, C_FILE, C_SNIP, C_COUNT };
 enum Kind { K_NONE, K_OPEN, K_APP, K_LOCK, K_RECYCLE, K_QUIT, K_EDITCFG, K_RELOAD, K_UNHIDE, K_EDITHIDDEN, K_COPY, K_CFGDIR,
-            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX, K_NOTE };
+            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX, K_NOTE, K_WINDOW, K_TIMER, K_TIMEROFF, K_NOTEADD, K_CFG, K_BROWSE, K_WEBCLEAR };
 
 struct Item {
     wstring id, title, sub, tl, kl, group;
@@ -54,6 +64,8 @@ struct Item {
     int score = 0;
     Kind kind = K_NONE;
     wstring a, b, alt;
+    bool pinned = false;
+    int tint = -1;
 };
 struct Snippet { wstring name, text; };
 struct Bang { wstring trig, name, url; };
@@ -67,7 +79,7 @@ static HWND g_hwnd;
 static const wchar_t* kClass = L"QuickPaletteWnd";
 static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3, WM_FILES_READY = WM_APP + 4;
 static UINT g_wmTaskbar;
-enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_PREVIEW = 4, T_FREE = 5 };
+enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_PREVIEW = 4, T_FREE = 5, T_ANIM = 6, T_SEL = 7, T_QUERY = 8, T_WIPE = 9 };
 
 static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath, g_filesPath;
 static wstring g_hotkey = L"Ctrl+Space", g_defaultBang = L"g";
@@ -96,6 +108,17 @@ static int g_recentCount = 6, g_width = 640, g_listMax = 430, g_appsLimit = 6, g
 static int g_noteFontSize = 15, g_noteW = 1000, g_noteH = 680;
 static wstring g_themeMode = L"auto", g_noteFont = L"Consolas", g_noteViewCfg = L"split";
 static wstring g_fileSkip = L"node_modules|.git|$RECYCLE.BIN|System Volume Information";
+static bool g_animations = true, g_showNumbers = true;
+static wstring g_windowTrigger = L"sw", g_pinsPath;
+static wstring g_webTrigger = L"w", g_webSearchUrl = L"https://duckduckgo.com/?q={q}";
+static vector<wstring> g_webExt;
+static int g_webW = 1100, g_webH = 720;
+static bool g_webPrivate = true, g_webBlockDl = true;
+static std::unordered_set<wstring> g_pins;
+static vector<std::pair<wstring, wstring>> g_alias;   // extra search word -> item title
+struct TimerRec { UINT id; wstring label; };
+static vector<TimerRec> g_timers;
+static UINT g_nextTimer = 100;
 static bool g_filesLoaded = false;
 static volatile LONG g_filesBusy = 0;
 static vector<AppEntry> g_apps;
@@ -218,6 +241,14 @@ static bool WriteFileUtf8(const wstring& path, const wstring& text) {   // write
     return MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 }
 
+static void WipeDir(const wstring& dir) {   // delete a folder tree (used for browser data)
+    wstring d = dir + wstring(1, L'\0');
+    SHFILEOPSTRUCTW op = {};
+    op.wFunc = FO_DELETE; op.pFrom = d.c_str();
+    op.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    SHFileOperationW(&op);
+}
+
 // ------------------------------------------------------------------ config
 static void DefaultConfig() {
     WriteText(g_cfgPath,
@@ -269,6 +300,25 @@ static void DefaultConfig() {
         L"hide_on_focus_loss=1\n"
         L"apps_limit=6\n"
         L"other_limit=4\n"
+        L"animations=1\n"
+        L"show_numbers=1\n"
+        L"# window_trigger: type  sw chrome  to jump to an open window (leave empty to disable)\n"
+        L"window_trigger=sw\n"
+        L"# alias=word|Exact item title   e.g. alias=ps|PowerShell   (then typing  ps  finds PowerShell first)\n"
+        L"# alias=ps|PowerShell\n"
+        L"\n"
+        L"# ---- Built-in web browser: type  w  and a space (needs the Microsoft Edge WebView2 Runtime) ----\n"
+        L"# The search box becomes the address bar. Enter loads the page right here. Esc closes it.\n"
+        L"web_trigger=w\n"
+        L"# used when you type words instead of a website address\n"
+        L"web_search=https://duckduckgo.com/?q={q}\n"
+        L"web_width=1100\n"
+        L"web_height=720\n"
+        L"# 1 = forget cookies/history/cache every time the browser closes (lightest, most private)\n"
+        L"web_private=1\n"
+        L"web_block_downloads=1\n"
+        L"# Optional extension: unzip e.g. the uBlock Origin Lite release and point to its folder (one line per extension).\n"
+        L"# web_extension=D:\\Extensions\\uBOLite\n"
         L"# theme: auto (follows Windows) / dark / light.  at_cursor: open at the mouse pointer instead of screen center.\n"
         L"# note_view: edit / split / preview.  show_recent: show your most-used items when the box is empty.\n"
         L"\n"
@@ -281,7 +331,7 @@ static void DefaultConfig() {
         L"bang=yt|YouTube|https://www.youtube.com/results?search_query={q}\n"
         L"bang=gh|GitHub|https://github.com/search?q={q}\n"
         L"bang=so|Stack Overflow|https://stackoverflow.com/search?q={q}\n"
-        L"bang=w|Wikipedia|https://en.wikipedia.org/w/index.php?search={q}\n"
+        L"bang=wiki|Wikipedia|https://en.wikipedia.org/w/index.php?search={q}\n"
         L"bang=r|Reddit|https://www.reddit.com/search/?q={q}\n"
         L"bang=maps|Google Maps|https://www.google.com/maps/search/{q}\n"
         L"bang=a|Amazon|https://www.amazon.com/s?k={q}\n"
@@ -299,7 +349,7 @@ static void LoadConfig() {
     if (!PathFileExistsW(g_cfgPath.c_str())) { DefaultConfig(); g_firstRun = true; }
     vector<wstring> lines;
     ReadLines(g_cfgPath, lines);
-    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear(); g_notes.clear();
+    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear(); g_notes.clear(); g_alias.clear(); g_webExt.clear();
     for (auto& raw : lines) {
         wstring l = Trim(raw);
         if (l.empty() || l[0] == L'#') continue;
@@ -326,6 +376,20 @@ static void LoadConfig() {
         else if (k == L"hide_on_focus_loss") g_hideOnFocusLoss = (v != L"0");
         else if (k == L"apps_limit") g_appsLimit = std::max(1, std::min(30, _wtoi(v.c_str())));
         else if (k == L"other_limit") g_otherLimit = std::max(1, std::min(30, _wtoi(v.c_str())));
+        else if (k == L"animations") g_animations = (v != L"0");
+        else if (k == L"show_numbers") g_showNumbers = (v != L"0");
+        else if (k == L"window_trigger") g_windowTrigger = v;
+        else if (k == L"web_trigger") g_webTrigger = v;
+        else if (k == L"web_search") { if (!v.empty()) g_webSearchUrl = v; }
+        else if (k == L"web_extension") { if (!v.empty()) g_webExt.push_back(v); }
+        else if (k == L"web_width") g_webW = std::max(560, std::min(2400, _wtoi(v.c_str())));
+        else if (k == L"web_height") g_webH = std::max(400, std::min(1600, _wtoi(v.c_str())));
+        else if (k == L"web_private") g_webPrivate = (v != L"0");
+        else if (k == L"web_block_downloads") g_webBlockDl = (v != L"0");
+        else if (k == L"alias") {
+            size_t b = v.find(L'|');
+            if (b != wstring::npos && b > 0) g_alias.push_back({ lower(Trim(v.substr(0, b))), lower(Trim(v.substr(b + 1))) });
+        }
         else if (k == L"note_view") g_noteViewCfg = lower(v);
         else if (k == L"note_font") { if (!v.empty()) g_noteFont = v; }
         else if (k == L"note_font_size") g_noteFontSize = std::max(9, std::min(32, _wtoi(v.c_str())));
@@ -425,6 +489,13 @@ static void LoadState() {
     ln.clear();
     if (ReadLines(g_hiddenPath, ln))
         for (auto& l : ln) { auto p = Split(l, L'\t'); if (!p[0].empty()) g_hidden[p[0]] = p.size() > 1 ? p[1] : p[0]; }
+    ln.clear();
+    if (ReadLines(g_pinsPath, ln)) for (auto& l : ln) if (!l.empty()) g_pins.insert(l);
+}
+static void SavePins() {
+    wstring t;
+    for (auto& id : g_pins) t += id + L"\n";
+    WriteText(g_pinsPath, t);
 }
 
 // ------------------------------------------------------------------ catalog
@@ -559,6 +630,8 @@ static void BuildCatalog() {
 
     Add(v, L"cmd:startup-on", L"Start with Windows: turn on", L"Launch Quick Palette at login (delayed, low priority)", L"startup autostart boot login", C_CMD, 0xE7E8, K_STARTUP_ON);
     Add(v, L"cmd:startup-off", L"Start with Windows: turn off", L"Stop launching at login", L"startup autostart boot login disable", C_CMD, 0xE7E8, K_STARTUP_OFF);
+    Add(v, L"cmd:browser", L"Open web browser", L"Browse right inside the palette (same as typing: w )", L"internet web surf chrome edge website", C_CMD, 0xE774, K_BROWSE);
+    Add(v, L"cmd:webclear", L"Clear browser data", L"Delete the palette browser's cookies, cache and history", L"cookies cache history privacy web", C_CMD, 0xE74D, K_WEBCLEAR);
     Add(v, L"cmd:reindex", L"Rebuild file index", L"Re-scan the folders used by file search", L"files refresh update search", C_CMD, 0xE72C, K_REINDEX);
 
     // quick folders
@@ -590,12 +663,32 @@ static void BuildCatalog() {
     // snippets
     for (auto& sn : g_snippets) Add(v, L"snip:" + sn.name, sn.name, L"Snippet \u00B7 Enter copies it", L"", C_SNIP, 0, K_COPY, sn.text);
 
+    // quick settings (no need to edit config.ini)
+    struct TG { const wchar_t* id; const wchar_t* title; const wchar_t* sub; const wchar_t* key; const wchar_t* val; };
+    static const TG tg[] = {
+        { L"theme-dark", L"Theme: dark", L"Always use the dark look", L"theme", L"dark" },
+        { L"theme-light", L"Theme: light", L"Always use the light look", L"theme", L"light" },
+        { L"theme-auto", L"Theme: follow Windows", L"Match the Windows light/dark setting", L"theme", L"auto" },
+        { L"compact-on", L"Compact mode: on", L"Smaller, denser rows", L"compact", L"1" },
+        { L"compact-off", L"Compact mode: off", L"Roomy rows with two lines", L"compact", L"0" },
+        { L"cursor-on", L"Open at mouse cursor: on", L"The palette appears where the pointer is", L"at_cursor", L"1" },
+        { L"cursor-off", L"Open at mouse cursor: off", L"The palette appears centered on screen", L"at_cursor", L"0" },
+        { L"recent-on", L"Suggestions when empty: show", L"Show pinned and most-used items on open", L"show_recent", L"1" },
+        { L"recent-off", L"Suggestions when empty: hide", L"Start with just the search box", L"show_recent", L"0" },
+        { L"anim-on", L"Animations: on", L"Fade and slide effects", L"animations", L"1" },
+        { L"anim-off", L"Animations: off", L"Instant, no effects", L"animations", L"0" },
+        { L"footer-on", L"Footer hints: show", L"Key hints under the list", L"show_footer", L"1" },
+        { L"footer-off", L"Footer hints: hide", L"Hide the key hints", L"show_footer", L"0" },
+    };
+    for (auto& t : tg) Add(v, wstring(L"cfg:") + t.id, t.title, t.sub, L"setting option preference customize appearance", C_CMD, 0xE713, K_CFG, t.key, t.val);
+
     // notes
     for (auto& nd : g_notes) Add(v, L"note:" + nd.trig, L"Open note: " + nd.name, nd.path, L"note notes markdown write journal", C_CMD, 0xE70F, K_NOTE, nd.trig);
 
     // apps
     for (auto& a : g_apps) Add(v, L"app:" + a.id, a.name, L"Application", L"", C_APP, 0, K_APP, a.id);
 
+    for (auto& al : g_alias) for (auto& it : v) if (it.tl == al.second) it.kl += L" " + al.first;
     g_catalog.swap(v);
     g_catalogDirty = false;
 }
@@ -811,6 +904,28 @@ struct Calc {
     double primary() {
         ws();
         if (*p == L'(') { p++; double v = expr(); ws(); if (*p == L')') p++; else ok = false; return v; }
+        if (iswalpha(*p)) {
+            wstring id;
+            while (iswalpha(*p)) { id += (wchar_t)towlower(*p); p++; }
+            if (id == L"pi") return 3.14159265358979323846;
+            if (id == L"e") return 2.71828182845904523536;
+            ws();
+            if (*p != L'(') { ok = false; return 0; }
+            p++; double a = expr(); ws();
+            if (*p == L')') p++; else ok = false;
+            if (id == L"sqrt") return sqrt(a);
+            if (id == L"abs") return fabs(a);
+            if (id == L"sin") return sin(a);
+            if (id == L"cos") return cos(a);
+            if (id == L"tan") return tan(a);
+            if (id == L"log") return log10(a);
+            if (id == L"ln") return log(a);
+            if (id == L"exp") return exp(a);
+            if (id == L"round") return floor(a + 0.5);
+            if (id == L"floor") return floor(a);
+            if (id == L"ceil") return ceil(a);
+            ok = false; return 0;
+        }
         wchar_t* e = nullptr; double v = wcstod(p, &e);
         if (e == p) { ok = false; return 0; }
         p = e; return v;
@@ -823,6 +938,7 @@ static bool TryCalc(const wstring& q, wstring& result) {
         if (c >= L'0' && c <= L'9') digit = true;
         else if (c == L'+' || c == L'-' || c == L'*' || c == L'/' || c == L'%' || c == L'^') { if (i > 0) op = true; }
         else if (c == L'(' || c == L')') op = op || c == L'(';
+        else if (iswalpha(c)) {}
         else if (c != L'.' && c != L' ' && c != L',') return false;
     }
     if (!digit || !op) return false;
@@ -838,8 +954,18 @@ static bool TryCalc(const wstring& q, wstring& result) {
 // ------------------------------------------------------------------ search
 static bool IsWordChar(wchar_t c) { return iswalnum(c) != 0; }
 
+static bool KwHas(const wstring& kw, const wstring& q) {   // whole-word match inside the keyword list
+    size_t pos = 0;
+    while ((pos = kw.find(q, pos)) != wstring::npos) {
+        bool l = pos == 0 || kw[pos - 1] == L' ', r = pos + q.size() == kw.size() || kw[pos + q.size()] == L' ';
+        if (l && r) return true;
+        pos++;
+    }
+    return false;
+}
 static int ScoreOne(const wstring& q, const wstring& t, const wstring& kw) {
     if (t == q) return 100;
+    if (!kw.empty() && KwHas(kw, q)) return 90;
     if (t.compare(0, q.size(), q) == 0) return 85;
     for (size_t i = 1; i < t.size(); i++)
         if (!IsWordChar(t[i - 1]) && t.compare(i, q.size(), q) == 0) return 70;
@@ -1030,6 +1156,232 @@ static Item QuickItem(const wstring& title, const wstring& sub, const wstring& c
     return it;
 }
 
+static long ParseDur(const wstring& s) {   // "10m", "1h30m", "90s", "10" (minutes)
+    size_t i = 0; double total = 0; bool any = false;
+    while (i < s.size()) {
+        if (!iswdigit(s[i]) && s[i] != L'.') return 0;
+        size_t j = i;
+        while (j < s.size() && (iswdigit(s[j]) || s[j] == L'.')) j++;
+        double n = wcstod(s.substr(i, j - i).c_str(), nullptr);
+        size_t k = j;
+        while (k < s.size() && iswalpha(s[k])) k++;
+        wstring u = lower(s.substr(j, k - j));
+        double mul = 60;
+        if (!u.empty()) {
+            wchar_t c = u[0];
+            if (c == L's') mul = 1; else if (c == L'm') mul = 60; else if (c == L'h') mul = 3600; else if (c == L'd') mul = 86400; else return 0;
+        }
+        total += n * mul; any = true; i = k;
+    }
+    if (!any || total > 86400.0 * 30) return 0;
+    return (long)total;
+}
+static wstring FormatDur(long s) {
+    wstring o;
+    if (s >= 3600) { o += std::to_wstring(s / 3600) + L" h "; s %= 3600; }
+    if (s >= 60) { o += std::to_wstring(s / 60) + L" min "; s %= 60; }
+    if (s > 0 || o.empty()) o += std::to_wstring(s) + L" s";
+    while (!o.empty() && o.back() == L' ') o.pop_back();
+    return o;
+}
+
+static wstring B64Enc(const wstring& s) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr);
+    std::string u((size_t)n, '\0');
+    if (n) WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &u[0], n, nullptr, nullptr);
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    wstring o; size_t i = 0;
+    for (; i + 2 < u.size(); i += 3) {
+        unsigned v = ((unsigned char)u[i] << 16) | ((unsigned char)u[i + 1] << 8) | (unsigned char)u[i + 2];
+        o += (wchar_t)T[v >> 18]; o += (wchar_t)T[(v >> 12) & 63]; o += (wchar_t)T[(v >> 6) & 63]; o += (wchar_t)T[v & 63];
+    }
+    if (i + 1 == u.size()) {
+        unsigned v = (unsigned char)u[i] << 16;
+        o += (wchar_t)T[v >> 18]; o += (wchar_t)T[(v >> 12) & 63]; o += L"==";
+    } else if (i + 2 == u.size()) {
+        unsigned v = ((unsigned char)u[i] << 16) | ((unsigned char)u[i + 1] << 8);
+        o += (wchar_t)T[v >> 18]; o += (wchar_t)T[(v >> 12) & 63]; o += (wchar_t)T[(v >> 6) & 63]; o += L'=';
+    }
+    return o;
+}
+static int B64Val(wchar_t c) {
+    if (c >= L'A' && c <= L'Z') return c - L'A';
+    if (c >= L'a' && c <= L'z') return c - L'a' + 26;
+    if (c >= L'0' && c <= L'9') return c - L'0' + 52;
+    if (c == L'+' || c == L'-') return 62;
+    if (c == L'/' || c == L'_') return 63;
+    return -1;
+}
+static bool B64Dec(const wstring& s, wstring& out) {
+    std::string b; unsigned acc = 0; int bits = 0;
+    for (wchar_t c : s) {
+        if (c == L'=' || iswspace(c)) continue;
+        int v = B64Val(c);
+        if (v < 0) return false;
+        acc = (acc << 6) | (unsigned)v; bits += 6;
+        if (bits >= 8) { bits -= 8; b += (char)((acc >> bits) & 0xFF); }
+    }
+    if (b.empty()) return false;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b.data(), (int)b.size(), nullptr, 0);
+    if (n <= 0) return false;
+    out.assign((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, b.data(), (int)b.size(), &out[0], n);
+    return true;
+}
+static wstring UrlDec(const wstring& s) {
+    std::string b;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == L'%' && i + 2 < s.size() + 0 && iswxdigit(s[i + 1]) && iswxdigit(s[i + 2])) {
+            wchar_t h[3] = { s[i + 1], s[i + 2], 0 };
+            b += (char)wcstol(h, nullptr, 16); i += 2;
+        } else if (s[i] == L'+') b += ' ';
+        else {
+            char tmp[8]; int n = WideCharToMultiByte(CP_UTF8, 0, &s[i], 1, tmp, 8, nullptr, nullptr);
+            if (n > 0) b.append(tmp, (size_t)n);
+        }
+    }
+    int n = MultiByteToWideChar(CP_UTF8, 0, b.data(), (int)b.size(), nullptr, 0);
+    wstring o((size_t)std::max(n, 0), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, b.data(), (int)b.size(), &o[0], n);
+    return o;
+}
+static bool TryTextTool(const wstring& cmd, const wstring& arg, vector<Item>& res) {
+    wstring out, label;
+    if (cmd == L"upper") { out = arg; for (auto& c : out) c = (wchar_t)towupper(c); label = L"UPPERCASE"; }
+    else if (cmd == L"lower") { out = arg; for (auto& c : out) c = (wchar_t)towlower(c); label = L"lowercase"; }
+    else if (cmd == L"title") {
+        bool st = true; out = arg;
+        for (auto& c : out) { if (iswspace(c)) st = true; else { c = (wchar_t)(st ? towupper(c) : towlower(c)); st = false; } }
+        label = L"Title Case";
+    }
+    else if (cmd == L"len") {
+        size_t words = 0; bool in = false;
+        for (wchar_t c : arg) { bool sp = iswspace(c) != 0; if (!sp && !in) words++; in = !sp; }
+        out = std::to_wstring(arg.size()) + L" characters, " + std::to_wstring(words) + L" words"; label = L"Length";
+    }
+    else if (cmd == L"b64") { out = B64Enc(arg); label = L"Base64 encode"; }
+    else if (cmd == L"b64d") { if (!B64Dec(arg, out)) return false; label = L"Base64 decode"; }
+    else if (cmd == L"urlenc") { out = UrlEncode(arg); label = L"URL encode"; }
+    else if (cmd == L"urldec") { out = UrlDec(arg); label = L"URL decode"; }
+    else return false;
+    res.push_back(QuickItem(out, label + L" \u00B7 Enter copies", out));
+    return true;
+}
+
+static bool HexV(wchar_t c, int& v) {
+    if (c >= L'0' && c <= L'9') { v = c - L'0'; return true; }
+    wchar_t d = (wchar_t)towlower(c);
+    if (d >= L'a' && d <= L'f') { v = d - L'a' + 10; return true; }
+    return false;
+}
+static bool TryColor(const wstring& q, int& r, int& g, int& b) {
+    wstring t = Trim(q);
+    if (t.empty()) return false;
+    if (t[0] == L'#') {
+        wstring h = t.substr(1);
+        if (h.size() == 3) { wstring x; for (wchar_t c : h) { x += c; x += c; } h = x; }
+        if (h.size() != 6) return false;
+        int v[6];
+        for (int i = 0; i < 6; i++) if (!HexV(h[i], v[i])) return false;
+        r = v[0] * 16 + v[1]; g = v[2] * 16 + v[3]; b = v[4] * 16 + v[5];
+        return true;
+    }
+    wstring l = lower(t);
+    if (l.rfind(L"rgb(", 0) == 0 && l.back() == L')') {
+        auto p = Split(l.substr(4, l.size() - 5), L',');
+        if (p.size() != 3) return false;
+        int c[3];
+        for (int i = 0; i < 3; i++) {
+            wstring x = Trim(p[i]);
+            if (x.empty() || x.find_first_not_of(L"0123456789") != wstring::npos) return false;
+            c[i] = _wtoi(x.c_str());
+            if (c[i] > 255) return false;
+        }
+        r = c[0]; g = c[1]; b = c[2];
+        return true;
+    }
+    return false;
+}
+static void RgbToHsl(int r, int g, int b, int& h, int& s, int& l) {
+    double R = r / 255.0, G = g / 255.0, B = b / 255.0;
+    double mx = std::max(R, std::max(G, B)), mn = std::min(R, std::min(G, B)), d = mx - mn;
+    double L = (mx + mn) / 2, H = 0, S = 0;
+    if (d > 0) {
+        S = d / (1 - fabs(2 * L - 1));
+        if (mx == R) H = fmod((G - B) / d, 6.0);
+        else if (mx == G) H = (B - R) / d + 2;
+        else H = (R - G) / d + 4;
+        H *= 60; if (H < 0) H += 360;
+    }
+    h = (int)(H + 0.5); s = (int)(S * 100 + 0.5); l = (int)(L * 100 + 0.5);
+}
+
+static bool TryBase(const wstring& ql, wstring& out) {   // "255 to hex", "0xff to dec", "0b101 to dec"
+    const wchar_t* p = ql.c_str(); wchar_t* e = nullptr;
+    unsigned long long v;
+    if (p[0] == L'0' && (p[1] == L'x' || p[1] == L'X')) v = wcstoull(p + 2, &e, 16);
+    else if (p[0] == L'0' && (p[1] == L'b' || p[1] == L'B')) v = wcstoull(p + 2, &e, 2);
+    else v = wcstoull(p, &e, 10);
+    if (e == p) return false;
+    wstring rest = Trim(e);
+    if (rest.rfind(L"to ", 0) != 0 && rest.rfind(L"in ", 0) != 0) return false;
+    rest = Trim(rest.substr(3));
+    wchar_t buf[96];
+    if (rest == L"hex") swprintf(buf, 96, L"0x%llX", v);
+    else if (rest == L"dec") swprintf(buf, 96, L"%llu", v);
+    else if (rest == L"oct") swprintf(buf, 96, L"0o%llo", v);
+    else if (rest == L"bin") {
+        wstring b; unsigned long long x = v;
+        if (!x) b = L"0";
+        while (x) { b.insert(b.begin(), (wchar_t)(L'0' + (x & 1))); x >>= 1; }
+        out = L"0b" + b; return true;
+    }
+    else return false;
+    out = buf;
+    return true;
+}
+
+struct WinEnum { vector<std::pair<HWND, wstring>> list; };
+static BOOL CALLBACK EnumWinProc(HWND h, LPARAM lp) {
+    auto* e = (WinEnum*)lp;
+    if (!IsWindowVisible(h) || h == g_hwnd) return TRUE;
+    if (GetWindow(h, GW_OWNER) != nullptr) return TRUE;
+    if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+    DWORD cloaked = 0;
+    DwmGetWindowAttribute(h, 14, &cloaked, sizeof cloaked);   // skip hidden Store-app ghosts
+    if (cloaked) return TRUE;
+    int n = GetWindowTextLengthW(h);
+    if (n <= 0) return TRUE;
+    wstring t((size_t)n, L'\0');
+    GetWindowTextW(h, &t[0], n + 1);
+    if (t == L"Program Manager") return TRUE;
+    e->list.push_back({ h, t });
+    return TRUE;
+}
+static vector<Item> WindowQuery(const wstring& text) {
+    WinEnum we;
+    EnumWindows(EnumWinProc, (LPARAM)&we);
+    vector<wstring> toks;
+    for (auto& t : Split(lower(text), L' ')) if (!t.empty()) toks.push_back(t);
+    vector<Item> res;
+    for (auto& w : we.list) {
+        wstring lt = lower(w.second);
+        bool ok = true;
+        for (auto& t : toks) if (lt.find(t) == wstring::npos) { ok = false; break; }
+        if (!ok) continue;
+        Item it; it.cat = C_CMD; it.group = L"Open windows"; it.glyph = 0xE737;
+        it.title = w.second; it.sub = L"Switch to this window"; it.kind = K_WINDOW;
+        it.a = std::to_wstring((long long)(INT_PTR)w.first);
+        res.push_back(it);
+        if (res.size() >= 12) break;
+    }
+    if (res.empty()) {
+        Item it; it.cat = C_CMD; it.group = L"Open windows"; it.glyph = 0xE737; it.title = L"No matching open window"; it.sub = L"Type part of a window title";
+        res.push_back(it);
+    }
+    return res;
+}
+
 static Item MakeBangItem(const Bang& b, const wstring& text, Cat cat) {
     Item it;
     it.cat = cat; it.group = CatName(cat); it.glyph = DefaultGlyph(cat); it.kind = K_OPEN;
@@ -1047,15 +1399,17 @@ static Item MakeBangItem(const Bang& b, const wstring& text, Cat cat) {
     return it;
 }
 
-static vector<Item> RunQuery(const wstring& raw) {
+static vector<Item> RunQueryImpl(const wstring& raw) {
     EnsureCatalog();
     vector<Item> res;
     wstring q = Trim(raw);
 
-    if (q.empty()) {   // most used
+    if (q.empty()) {   // pinned first, then most used
+        for (auto& it : g_catalog)
+            if (g_pins.count(it.id) && !g_hidden.count(it.id)) { Item c = it; c.group = L"Pinned"; res.push_back(c); }
         if (!g_showRecent) return res;
         vector<const Item*> f;
-        for (auto& it : g_catalog) if (it.track && !g_hidden.count(it.id) && g_usage.count(it.id)) f.push_back(&it);
+        for (auto& it : g_catalog) if (it.track && !g_hidden.count(it.id) && !g_pins.count(it.id) && g_usage.count(it.id)) f.push_back(&it);
         std::sort(f.begin(), f.end(), [](const Item* x, const Item* y) { return g_usage[x->id] > g_usage[y->id]; });
         for (size_t i = 0; i < f.size() && i < (size_t)g_recentCount; i++) { Item c = *f[i]; c.group = L"Frequently used"; res.push_back(c); }
         return res;
@@ -1065,10 +1419,78 @@ static vector<Item> RunQuery(const wstring& raw) {
     size_t lead = raw.find_first_not_of(L' ');
     wstring r2 = raw.substr(lead);
     size_t sp = r2.find(L' ');
+    if (!g_webTrigger.empty()) {   // "w github.com" -> offer to open it in the built-in browser
+        wstring wt = lower(g_webTrigger);
+        bool exact = lower(q) == wt;
+        bool withText = sp != wstring::npos && sp > 0 && lower(r2.substr(0, sp)) == wt;
+        if (exact || withText) {
+            wstring rest = withText ? Trim(r2.substr(sp + 1)) : L"";
+            Item it; it.cat = C_WEB; it.group = L"Web browser"; it.glyph = 0xE774;
+            it.title = rest.empty() ? L"Open the web browser" : L"Browse: " + rest;
+            it.sub = L"Loads the page right here \u00B7 Esc closes it";
+            it.kind = K_BROWSE; it.a = rest;
+            res.push_back(it);
+            return res;
+        }
+    }
     if (sp != wstring::npos && sp > 0) {
         wstring trig = r2.substr(0, sp);
         for (auto& b : g_bangs)
             if (_wcsicmp(b.trig.c_str(), trig.c_str()) == 0) { res.push_back(MakeBangItem(b, Trim(r2.substr(sp + 1)), C_BANG)); return res; }
+    }
+
+    if (sp != wstring::npos && sp > 0) {
+        wstring w0 = lower(r2.substr(0, sp)), rest = Trim(r2.substr(sp + 1));
+        for (auto& nd : g_notes)   // quick capture: "n+ buy milk" appends a line to the note
+            if (w0 == lower(nd.trig) + L"+" && !rest.empty()) {
+                Item it; it.cat = C_CMD; it.group = L"Notes"; it.glyph = 0xE70F;
+                it.title = L"Add to " + nd.name + L": " + rest;
+                it.sub = L"Quick capture \u00B7 appends a line without opening the note";
+                it.kind = K_NOTEADD; it.a = nd.trig; it.b = rest;
+                res.push_back(it);
+                return res;
+            }
+        if (!g_windowTrigger.empty() && w0 == lower(g_windowTrigger)) return WindowQuery(rest);
+        if (w0 == L"timer" || w0 == L"remind") {
+            Item it; it.cat = C_CMD; it.group = L"Timer"; it.glyph = 0xE916;
+            wstring lr = lower(rest);
+            if (lr == L"off" || lr == L"cancel") {
+                it.title = L"Cancel all timers"; it.sub = std::to_wstring(g_timers.size()) + L" running"; it.kind = K_TIMEROFF;
+            } else {
+                size_t s2 = rest.find(L' ');
+                wstring dur = s2 == wstring::npos ? rest : rest.substr(0, s2);
+                wstring label = s2 == wstring::npos ? L"" : Trim(rest.substr(s2 + 1));
+                long secs = ParseDur(dur);
+                if (secs > 0) {
+                    it.title = L"Start a " + FormatDur(secs) + L" timer";
+                    it.sub = label.empty() ? L"You get a notification when it ends" : L"Reminder: " + label;
+                    it.kind = K_TIMER; it.a = std::to_wstring(secs); it.b = label.empty() ? L"Time is up" : label;
+                } else {
+                    it.title = L"Set a timer or reminder"; it.sub = L"Try:  timer 10m   \u00B7   remind 1h30m call mom   \u00B7   timer off";
+                }
+            }
+            res.push_back(it);
+            return res;
+        }
+        if (!rest.empty() && TryTextTool(w0, rest, res)) return res;
+    }
+    {   // colors: #ff8800  or  rgb(255,136,0)
+        int cr, cg, cb;
+        if (TryColor(q, cr, cg, cb)) {
+            int hh, ss, ll; RgbToHsl(cr, cg, cb, hh, ss, ll);
+            wchar_t hx[16], rg[48], hs[48];
+            swprintf(hx, 16, L"#%02X%02X%02X", cr, cg, cb);
+            swprintf(rg, 48, L"rgb(%d, %d, %d)", cr, cg, cb);
+            swprintf(hs, 48, L"hsl(%d, %d%%, %d%%)", hh, ss, ll);
+            const wchar_t* vals[3] = { hx, rg, hs };
+            const wchar_t* subs[3] = { L"HEX \u00B7 Enter copies", L"RGB \u00B7 Enter copies", L"HSL \u00B7 Enter copies" };
+            for (int i = 0; i < 3; i++) {
+                Item it = QuickItem(vals[i], subs[i], vals[i]);
+                it.group = L"Color"; it.glyph = 0; it.tint = (int)RGB(cr, cg, cb);
+                res.push_back(it);
+            }
+            return res;
+        }
     }
 
     // file search: "f report"
@@ -1097,6 +1519,7 @@ static vector<Item> RunQuery(const wstring& raw) {
         wstring ql0 = lower(q), t, sb, cp;
         if (TryInstant(ql0, t, sb, cp)) res.push_back(QuickItem(t, sb, cp));
         if (TryConvert(ql0, cp)) res.push_back(QuickItem(L"= " + cp, L"Unit conversion \u00B7 Enter copies", cp));
+        else if (TryBase(ql0, cp)) res.push_back(QuickItem(L"= " + cp, L"Number base \u00B7 Enter copies", cp));
     }
 
     for (auto& nd : g_notes)   // typed exactly the note trigger: offer it first
@@ -1163,6 +1586,12 @@ static vector<Item> RunQuery(const wstring& raw) {
     return res;
 }
 
+static vector<Item> RunQuery(const wstring& raw) {
+    vector<Item> r = RunQueryImpl(raw);
+    for (auto& it : r) it.pinned = !it.id.empty() && g_pins.count(it.id) > 0;
+    return r;
+}
+
 // ------------------------------------------------------------------ actions
 static void SetClipboard(const wstring& s) {
     if (!OpenClipboard(g_hwnd)) return;
@@ -1209,6 +1638,8 @@ static void ExitWin(UINT flags) {
 }
 static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon = NIIF_INFO);
 
+static wstring ExpandNotePath(const wstring& p);
+
 static void Exec(const Item& it) {
     if (it.confirm && MessageBoxW(nullptr, (it.title + L"?").c_str(), L"Quick Palette", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) != IDYES) return;
     switch (it.kind) {
@@ -1229,6 +1660,36 @@ static void Exec(const Item& it) {
         case K_EDITCFG: OpenFile(g_cfgPath); break;
         case K_RELOAD: StartAppsThread(); break;
         case K_REINDEX: StartFilesThread(); break;
+        case K_CFG: SetConfigValue(it.a, it.b); break;
+        case K_WEBCLEAR: WipeDir(g_dir + L"\\web"); Balloon(L"Quick Palette", L"Browser data cleared.", NIIF_INFO); break;
+        case K_TIMER: {
+            long secs = _wtol(it.a.c_str());
+            UINT id = g_nextTimer++;
+            SetTimer(g_hwnd, id, (UINT)(std::min<long long>((long long)secs * 1000, 0x7FFFFFF0LL)), nullptr);
+            g_timers.push_back({ id, it.b });
+            Balloon(L"Timer started", FormatDur(secs).c_str(), NIIF_INFO);
+            break;
+        }
+        case K_TIMEROFF:
+            for (auto& t : g_timers) KillTimer(g_hwnd, t.id);
+            g_timers.clear();
+            break;
+        case K_NOTEADD: {
+            for (auto& nd : g_notes) {
+                if (_wcsicmp(nd.trig.c_str(), it.a.c_str()) != 0) continue;
+                wstring path = ExpandNotePath(nd.path), txt;
+                ReadFileUtf8(path, txt, 4u * 1024 * 1024);
+                wstring nl = (txt.empty() || txt.find(L"\r\n") != wstring::npos) ? L"\r\n" : L"\n";
+                if (!txt.empty() && txt.back() != L'\n') txt += nl;
+                txt += L"- " + it.b + nl;
+                size_t sl = path.find_last_of(L'\\');
+                if (sl != wstring::npos) SHCreateDirectoryExW(nullptr, path.substr(0, sl).c_str(), nullptr);
+                if (WriteFileUtf8(path, txt)) Balloon(L"Quick Palette", (L"Added to " + nd.name).c_str(), NIIF_INFO);
+                else Balloon(L"Quick Palette", L"Could not write the note. Check its path in config.ini.", NIIF_WARNING);
+                break;
+            }
+            break;
+        }
         case K_UNHIDE: g_hidden.clear(); DeleteFileW(g_hiddenPath.c_str()); break;
         case K_EDITHIDDEN:
             if (!PathFileExistsW(g_hiddenPath.c_str())) WriteText(g_hiddenPath, L"");

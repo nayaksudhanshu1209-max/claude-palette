@@ -4,7 +4,8 @@ A tiny offline launcher for Windows 10/11: apps, settings, files in your own fol
 calculator, unit conversion, and a Markdown note editor with live preview.
 
 ## What it does and does not do
-- **No network code.** No networking libraries are linked. Web "bangs" just hand a URL to your default browser.
+- **The app itself has no network code.** Web "bangs" hand a URL to your default browser. The optional built-in browser
+  (`w `) uses Microsoft's Edge WebView2 Runtime, and that runtime does the networking, not this program.
 - **No telemetry, accounts, updates or downloads.**
 - **No keyboard hooks, no clipboard watching, no screen capture, no injection into other processes.**
   The only global key is one registered hotkey (default Ctrl+Space).
@@ -26,7 +27,25 @@ calculator, unit conversion, and a Markdown note editor with live preview.
 | `f report` | file search |
 | `g cats`, `yt lofi` ... | web bangs |
 | `n ` (n + space) | note editor |
-| `10 km to mi`, `2*(3+4)`, `date`, `guid`, `> notepad file.txt` | quick answers / run box |
+| `10 km to mi`, `2*(3+4)`, `sqrt(16)`, `255 to hex`, `date`, `guid`, `> notepad file.txt` | quick answers / run box |
+| `#ff8800` or `rgb(255,136,0)` | color converter (HEX / RGB / HSL) |
+| `upper`/`lower`/`title`/`len`/`b64`/`b64d`/`urlenc`/`urldec` + text | text tools |
+| `timer 10m`, `remind 1h30m call mom`, `timer off` | timers and reminders (notification when done) |
+| `sw chrome` | switch to an open window |
+| `n+ buy milk` | quick capture: appends a line to your note without opening it |
+| Alt+1 ... Alt+9 | run the numbered result |
+| Ctrl+D | pin / unpin the selected item (pinned items show first when the box is empty) |
+| Ctrl+Shift+C | copy the path of a file result |
+
+## Built-in browser (`w `)
+- Type `w` and a space: the search box becomes an address bar. Type a site or search words, press Enter. Esc closes it.
+- Needs the Microsoft Edge WebView2 Runtime (already on most Windows 10/11 PCs).
+- It exists only while open: closing it ends every browser process and (by default) wipes cookies, cache and history.
+- Safety: only http/https pages, no downloads, camera/mic/location/notification requests are denied, no pop-up windows,
+  DevTools and password/autofill saving are off.
+- Extensions (such as uBlock Origin Lite): unzip the extension and add `web_extension=C:\path\to\folder` to config.ini.
+  WebView2 only supports part of the extension system, so this is best-effort.
+- Keys: Enter go, Alt+Left/Right back/forward, F5 reload, Ctrl+L address bar, Esc close. Command "Clear browser data".
 
 ## Notes (Markdown editor)
 - Type your note trigger and a space (default `n `). The search box becomes a large editor with live preview.
@@ -36,4 +55,5 @@ calculator, unit conversion, and a Markdown note editor with live preview.
 - Ctrl+B bold, Ctrl+I italic, Ctrl+K link. Enter continues lists and quotes. Task boxes in the preview are clickable.
 
 ## Settings
+You can also type things like "theme dark", "compact", "animations" or "cursor" in the palette to switch options without editing the file.
 Tray icon > Edit settings opens `config.ini` (theme, compact, width, at_cursor, show_recent, folders, notes, bangs, ...).

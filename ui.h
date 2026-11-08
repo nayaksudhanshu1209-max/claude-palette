@@ -20,18 +20,22 @@ static const Theme* g_th = &kDark;
 // ------------------------------------------------------------------ ui globals
 static HWND g_hQuery = nullptr, g_hEditor = nullptr;
 static WNDPROC g_oldQuery = nullptr, g_oldEditor = nullptr;
-static HBRUSH g_brBg = nullptr, g_brEd = nullptr;
+static HBRUSH g_brBg = nullptr, g_brEd = nullptr, g_brChip = nullptr;
+static bool g_webMode = false, g_addrDirty = false;
 static HFONT g_fChip = nullptr, g_fNoteHead = nullptr, g_fNote = nullptr;
 static bool g_win11 = false, g_noteMode = false, g_suppress = false, g_facesChecked = false, g_lastCompact = false;
 static int g_lineH = 28, g_qLines = 1;
 static RECT g_work = { 0, 0, 1920, 1080 };
 static POINT g_anchor = { 0, 0 };
 static wchar_t g_uiFace[64] = L"Segoe UI", g_iconFace[64] = L"Segoe MDL2 Assets";
-static const UINT WM_NOTE_CLOSE = WM_APP + 5;
+static const UINT WM_NOTE_CLOSE = WM_APP + 5, WM_WEB_GO = WM_APP + 6, WM_WEB_BACK = WM_APP + 7, WM_WEB_FWD = WM_APP + 8, WM_WEB_RELOAD = WM_APP + 9, WM_WEB_FOCUSADDR = WM_APP + 10;
 
 static void HidePalette();
 static void LayoutChildren();
 static void EnterNote(int idx);
+static void EnterWeb(const wstring& url);
+static void ExitWeb();
+static void WebResize(int W, int H);
 static void OnNoteChanged();
 static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon);
 
@@ -86,6 +90,8 @@ static void ApplyTheme() {
     g_th = t;
     if (g_brBg) DeleteObject(g_brBg);
     if (g_brEd) DeleteObject(g_brEd);
+    if (g_brChip) DeleteObject(g_brChip);
+    g_brChip = CreateSolidBrush(t->chip);
     g_brBg = CreateSolidBrush(t->bg);
     g_brEd = CreateSolidBrush(t->editorBg);
     if (g_win11 && g_hwnd) {
@@ -135,9 +141,47 @@ static int PalH() { int h = SearchH(); if (!g_rows.empty()) h += 1 + px(4) + Lis
 static int NoteW() { return std::max<int>(px(480), std::min<int>(px(g_noteW), (int)(g_work.right - g_work.left) - px(24))); }
 static int NoteH() { return std::max<int>(px(320), std::min<int>(px(g_noteH), (int)(g_work.bottom - g_work.top) - px(24))); }
 
+static double g_selY = -10000;               // animated highlight position
+static ULONGLONG g_animStart = 0;
+static int g_winX = 0, g_winY = 0, g_lastSig = -1;
+static HDC g_bbDC = nullptr; static HBITMAP g_bbBmp = nullptr, g_bbOld = nullptr; static int g_bbW = 0, g_bbH = 0;
+
+static int SelTargetY() {   // window y of the selected row (top), or far off-screen
+    int cy = ListTop() - g_scroll;
+    for (auto& r : g_rows) {
+        int h = r.header ? HdrH() : ItemH();
+        if (!r.header && r.idx == g_sel) return cy;
+        cy += h;
+    }
+    return -10000;
+}
+static void SnapSel() { g_selY = SelTargetY(); }
+static void StartSelAnim() {
+    if (g_animations) SetTimer(g_hwnd, T_SEL, 12, nullptr); else SnapSel();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+static void FreeBackBuffer() {
+    if (!g_bbDC) return;
+    SelectObject(g_bbDC, g_bbOld); DeleteObject(g_bbBmp); DeleteDC(g_bbDC);
+    g_bbDC = nullptr; g_bbBmp = nullptr; g_bbW = g_bbH = 0;
+}
+static HDC GetBackBuffer(HDC ref, int w, int h) {   // one reusable off-screen bitmap instead of a new one per paint
+    if (g_bbDC && g_bbW == w && g_bbH == h) return g_bbDC;
+    FreeBackBuffer();
+    g_bbDC = CreateCompatibleDC(ref);
+    g_bbBmp = CreateCompatibleBitmap(ref, w, h);
+    g_bbOld = (HBITMAP)SelectObject(g_bbDC, g_bbBmp);
+    g_bbW = w; g_bbH = h;
+    return g_bbDC;
+}
+
+static int WebHdr() { return px(52); }
+static int WebW() { return std::max(px(520), std::min(px(g_webW), (int)(g_work.right - g_work.left) - px(24))); }
+static int WebH() { return std::max(px(360), std::min(px(g_webH), (int)(g_work.bottom - g_work.top) - px(24))); }
+
 static void PlaceWindow(int w, int h, bool show) {
     int x = g_anchor.x, y = g_anchor.y;
-    if (g_noteMode && !g_atCursor) {
+    if ((g_noteMode || g_webMode) && !g_atCursor) {
         x = g_work.left + ((g_work.right - g_work.left) - w) / 2;
         y = g_work.top + ((g_work.bottom - g_work.top) - h) / 2;
     }
@@ -145,14 +189,19 @@ static void PlaceWindow(int w, int h, bool show) {
     if (x < g_work.left) x = g_work.left;
     if (y + h > g_work.bottom) y = g_work.bottom - h;   // never cut off by the screen edge
     if (y < g_work.top) y = g_work.top;
+    g_winX = x; g_winY = y;
     SetWindowPos(g_hwnd, show ? HWND_TOPMOST : nullptr, x, y, w, h, show ? SWP_SHOWWINDOW : (SWP_NOZORDER | SWP_NOACTIVATE));
 }
 
 static void ApplyLayout() {
-    int w = g_noteMode ? NoteW() : PalW(), h = g_noteMode ? NoteH() : PalH();
-    PlaceWindow(w, h, false);
-    if (!g_win11) SetWindowRgn(g_hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, px(14), px(14)), TRUE);
-    LayoutChildren();
+    int w = g_webMode ? WebW() : g_noteMode ? NoteW() : PalW(), h = g_webMode ? WebH() : g_noteMode ? NoteH() : PalH();
+    int sig = w * 7919 + h * 131 + g_qLines * 17 + (g_noteMode ? 3 : 0) + (g_webMode ? 5 : 0);
+    if (sig != g_lastSig) {   // only touch the window when its size really changed (keeps typing smooth)
+        g_lastSig = sig;
+        PlaceWindow(w, h, false);
+        if (!g_win11) SetWindowRgn(g_hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, px(14), px(14)), TRUE);
+        LayoutChildren();
+    }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -170,6 +219,7 @@ static void Refresh() {
     g_sel = g_results.empty() ? -1 : 0;
     g_hover = -1; g_scroll = 0;
     ApplyLayout();
+    SnapSel();
 }
 static void ClampListScroll() { g_scroll = std::max(0, std::min(g_scroll, std::max(0, ContentH() - ListH()))); }
 static void EnsureVisible() {
@@ -206,11 +256,18 @@ static void MoveSel(int d, bool wrap = true) {
     if (wrap) s = (s % n + n) % n; else s = std::max(0, std::min(n - 1, s));
     g_sel = s;
     EnsureVisible();
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    StartSelAnim();
 }
 static void RunSelected() {
     if (g_sel < 0 || g_sel >= (int)g_results.size()) return;
     Item it = g_results[g_sel];
+    if (it.kind == K_WINDOW) {   // activate while we still own the foreground, then close
+        HWND t = (HWND)(INT_PTR)_wtoi64(it.a.c_str());
+        if (IsWindow(t)) { if (IsIconic(t)) ShowWindow(t, SW_RESTORE); SetForegroundWindow(t); }
+        HidePalette();
+        return;
+    }
+    if (it.kind == K_BROWSE) { EnterWeb(it.a); return; }
     if (it.kind == K_NOTE) {
         for (size_t i = 0; i < g_notes.size(); i++)
             if (_wcsicmp(g_notes[i].trig.c_str(), it.a.c_str()) == 0) { EnterNote((int)i); return; }
@@ -233,17 +290,26 @@ static void HideIndex(int i) {
 // ------------------------------------------------------------------ query box (a real multi-line EDIT control that grows)
 static void OnQueryChanged() {
     if (g_suppress || g_noteMode) return;
+    if (g_webMode) { g_addrDirty = true; return; }
     wstring raw = GetEditText(g_hQuery);
     wstring low = lower(raw);
     for (size_t i = 0; i < g_notes.size(); i++)
         if (low == lower(g_notes[i].trig) + L" ") { EnterNote((int)i); return; }   // "n " turns the box into the note editor
+    if (!g_webTrigger.empty() && low == lower(g_webTrigger) + L" ") { EnterWeb(L""); return; }   // "w " opens the browser
     g_query = raw;
     for (auto& c : g_query) if (c == L'\r' || c == L'\n') c = L' ';
     int lines = (int)SendMessageW(g_hQuery, EM_GETLINECOUNT, 0, 0);
     lines = std::max(1, std::min(6, lines));
     bool changed = lines != g_qLines;
     g_qLines = lines;
-    Refresh();
+    bool heavy = false;   // file / window search: wait a moment while you are still typing
+    { wstring lw = lower(g_query); size_t b = lw.find_first_not_of(L' ');
+      if (b != wstring::npos) {
+          size_t e = lw.find(L' ', b);
+          if (e != wstring::npos) { wstring w0 = lw.substr(b, e - b); heavy = (w0 == lower(g_fileTrigger)) || (!g_windowTrigger.empty() && w0 == lower(g_windowTrigger)); }
+      } }
+    if (heavy) { SetTimer(g_hwnd, T_QUERY, 45, nullptr); if (changed) ApplyLayout(); }
+    else { KillTimer(g_hwnd, T_QUERY); Refresh(); }
     if (changed) SendMessageW(g_hQuery, EM_LINESCROLL, 0, -100);
 }
 
@@ -251,6 +317,13 @@ static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_KEYDOWN: {
             bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+            if (g_webMode) {   // the box is the address bar
+                if (w == VK_ESCAPE) { HidePalette(); return 0; }
+                if (w == VK_RETURN) { PostMessageW(g_hwnd, WM_WEB_GO, 0, 0); return 0; }
+                if (ctrl && w == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
+                if (w == VK_F5) { PostMessageW(g_hwnd, WM_WEB_RELOAD, 0, 0); return 0; }
+                break;
+            }
             switch (w) {
                 case VK_ESCAPE: HidePalette(); return 0;
                 case VK_DOWN: MoveSel(1); return 0;
@@ -267,6 +340,23 @@ static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                     } else RunSelected();
                     return 0;
                 case 'H': if (ctrl) { HideIndex(g_sel); return 0; } break;
+                case 'D':   // pin / unpin the selected item (shows first when the box is empty)
+                    if (ctrl && g_sel >= 0 && g_sel < (int)g_results.size() && g_results[g_sel].track) {
+                        wstring id = g_results[g_sel].id;
+                        if (g_pins.count(id)) g_pins.erase(id); else g_pins.insert(id);
+                        SavePins();
+                        int keep = g_sel;
+                        Refresh();
+                        if (!g_results.empty()) { g_sel = std::min(keep, (int)g_results.size() - 1); EnsureVisible(); SnapSel(); }
+                        return 0;
+                    }
+                    break;
+                case 'C':   // Ctrl+Shift+C copies the path of a file result
+                    if (ctrl && shift && g_sel >= 0 && g_sel < (int)g_results.size() && !g_results[g_sel].alt.empty()) {
+                        SetClipboard(g_results[g_sel].alt);
+                        return 0;
+                    }
+                    break;
                 case 'A': if (ctrl) { SendMessageW(h, EM_SETSEL, 0, -1); return 0; } break;
             }
             break;
@@ -275,9 +365,22 @@ static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             bool ctrl = GetKeyState(VK_CONTROL) < 0;
             if (w == 13) { if (GetKeyState(VK_SHIFT) < 0) break; return 0; }
             if (w == 27 || w == 9) return 0;
-            if (ctrl && (w == 8 || w == 1)) return 0;
+            if (ctrl && (w == 8 || w == 1 || w == 4)) return 0;
             break;
         }
+        case WM_SYSKEYDOWN:   // Alt+1 ... Alt+9 runs that result (in the browser: Alt+Left / Alt+Right)
+            if (g_webMode) {
+                if (w == VK_LEFT) { PostMessageW(g_hwnd, WM_WEB_BACK, 0, 0); return 0; }
+                if (w == VK_RIGHT) { PostMessageW(g_hwnd, WM_WEB_FWD, 0, 0); return 0; }
+                break;
+            }
+            if (w >= '1' && w <= '9') {
+                int i = (int)(w - '1');
+                if (i < (int)g_results.size()) { g_sel = i; RunSelected(); }
+                return 0;
+            }
+            break;
+        case WM_SYSCHAR: if (w >= '1' && w <= '9') return 0; break;
         case WM_MOUSEWHEEL: SendMessageW(g_hwnd, WM_MOUSEWHEEL, w, l); return 0;
         case WM_PAINT: {
             LRESULT r = CallWindowProcW(g_oldQuery, h, m, w, l);
@@ -333,6 +436,11 @@ static void DrawPalette(HDC dc, int W, int H) {
     int lt = ListTop(), lh = ListH();
     int sc = SaveDC(dc);
     IntersectClipRect(dc, 0, lt, W, lt + lh);
+    if (g_sel >= 0) {   // selection highlight glides to the chosen row
+        int tgt = SelTargetY();
+        int sy = (g_animations && g_selY > -9000) ? (int)g_selY : tgt;
+        if (tgt > -9000) FillRound(dc, { px(8), sy + px(1), W - px(8), sy + ItemH() - px(1) }, T.sel, px(8));
+    }
     int y = lt - g_scroll;
     for (auto& r : g_rows) {
         int h = r.header ? HdrH() : ItemH();
@@ -343,16 +451,27 @@ static void DrawPalette(HDC dc, int W, int H) {
                 const Item& it = g_results[r.idx];
                 bool sel = r.idx == g_sel;
                 RECT rr = { px(8), y + px(1), W - px(8), y + h - px(1) };
-                if (sel) FillRound(dc, rr, T.sel, px(8));
-                else if (r.idx == g_hover) FillRound(dc, rr, T.hov, px(8));
+                if (!sel && r.idx == g_hover) FillRound(dc, rr, T.hov, px(8));
                 COLORREF ac = Accent(it.cat);
                 int ts = px(g_compact ? 26 : 34);
                 RECT tile = { px(18), y + (h - ts) / 2, px(18) + ts, y + (h - ts) / 2 + ts };
-                FillRound(dc, tile, Mix(sel ? T.sel : T.bg, ac, T.dark ? 24 : 18), px(9));
+                if (it.tint >= 0) FillRound(dc, tile, (COLORREF)it.tint, px(9));
+                else FillRound(dc, tile, Mix(sel ? T.sel : T.bg, ac, T.dark ? 24 : 18), px(9));
                 wchar_t gl[2] = { it.glyph, 0 };
                 TextAt(dc, g_fIcon, ac, gl, tile, DT_CENTER | DT_VCENTER);
                 int tx = tile.right + px(12);
                 int right = W - px(g_hover >= 0 || ContentH() > lh ? 26 : 20);
+                int hx = right;
+                right -= ((g_showNumbers && r.idx < 9) ? px(48) : 0) + (it.pinned ? px(22) : 0);
+                if (g_showNumbers && r.idx < 9) {
+                    wchar_t nb[8]; swprintf(nb, 8, L"Alt+%d", r.idx + 1);
+                    TextAt(dc, g_fSub, T.dim, nb, { hx - px(44), y, hx, y + h }, DT_RIGHT | DT_VCENTER);
+                    hx -= px(48);
+                }
+                if (it.pinned) {
+                    wchar_t pg[2] = { 0xE718, 0 };
+                    TextAt(dc, g_fIcon, T.hdr, pg, { hx - px(18), y, hx, y + h }, DT_RIGHT | DT_VCENTER);
+                }
                 if (!g_compact) {
                     TextAt(dc, g_fTitle, T.text, it.title, { tx, y + px(7), right, y + px(27) }, 0);
                     TextAt(dc, g_fSub, T.dim, it.sub, { tx, y + px(27), right, y + px(45) }, 0);
@@ -376,7 +495,7 @@ static void DrawPalette(HDC dc, int W, int H) {
     if (g_showFooter) {
         int fy = lt + lh + px(6);
         FillRectC(dc, { 1, fy, W - 1, H - 1 }, T.footerBg);
-        TextAt(dc, g_fSub, T.footerText, L"\u21B5 Open      Ctrl+\u21B5 Show in folder      Ctrl+H Hide item      Esc Close", { px(20), fy, W - px(20), H - 1 }, DT_VCENTER);
+        TextAt(dc, g_fSub, T.footerText, L"\u21B5 Open    Alt+1-9 Quick run    Ctrl+D Pin    Ctrl+\u21B5 Show in folder    Ctrl+H Hide    Esc Close", { px(20), fy, W - px(20), H - 1 }, DT_VCENTER);
     }
 }
 
@@ -548,6 +667,11 @@ static void OnNoteChanged() {
 
 static void LayoutChildren() {
     int W, H; ClientWH(W, H);
+    if (g_webMode) {   // the search box becomes the address bar
+        MoveWindow(g_hQuery, px(118), (WebHdr() - g_lineH) / 2, W - px(118) - px(20), g_lineH, TRUE);
+        WebResize(W, H);
+        return;
+    }
     if (!g_noteMode) {
         int eh = g_qLines * g_lineH;
         MoveWindow(g_hQuery, px(52), (SearchH() - eh) / 2, W - px(52) - px(20), eh, TRUE);
@@ -567,6 +691,7 @@ static void LayoutChildren() {
 
 static void SetView(int v) {
     g_noteView = v;
+    g_lastSig = -1;
     ApplyLayout();
     RebuildPreview(false);
     if (v == 2) SetFocus(g_hwnd); else if (g_hEditor) SetFocus(g_hEditor);
@@ -622,6 +747,7 @@ static void EnterNote(int idx) {
     LoadChipCounts(); BuildChipOrder();
     g_md.Clear(); g_md.bodyFace = g_uiFace; g_md.monoFace = g_noteFont;
     g_pvScroll = 0; g_chipScroll = 0; g_chipHot = -1;
+    g_lastSig = -1;
     ApplyLayout();
     RebuildPreview(false);
     if (g_noteView == 2) SetFocus(g_hwnd); else SetFocus(g_hEditor);
@@ -901,6 +1027,276 @@ static void NoteWheel(int delta, int x, int y) {
     }
 }
 
+
+// ================================================================== BUILT-IN BROWSER (Microsoft WebView2)
+// Lives only while the palette browser is open: closing it releases every browser process.
+static int g_webLoading = 0;
+static RECT WebAddrBox(int W) { return { px(112), px(8), W - px(12), WebHdr() - px(8) }; }
+static void WebBtnRects(RECT r[3]) {
+    int s = px(32), y = (WebHdr() - s) / 2;
+    for (int i = 0; i < 3; i++) r[i] = { px(10) + i * (s + px(2)), y, px(10) + i * (s + px(2)) + s, y + s };
+}
+static wstring WebNormalize(const wstring& in) {   // address or search words -> a URL
+    wstring t = Trim(in);
+    for (auto& c : t) if (c == L'\r' || c == L'\n') c = L' ';
+    if (t.empty()) return L"";
+    wstring l = lower(t);
+    if (l.rfind(L"http://", 0) == 0 || l.rfind(L"https://", 0) == 0) return t;
+    if (t.find(L' ') == wstring::npos) {
+        if (l.rfind(L"localhost", 0) == 0) return L"http://" + t;
+        size_t slash = l.find(L'/');
+        wstring host = l.substr(0, slash);
+        size_t colon = host.find(L':');
+        if (colon != wstring::npos) host = host.substr(0, colon);
+        size_t dot = host.rfind(L'.');
+        if (dot != wstring::npos && dot > 0 && host.size() - dot - 1 >= 2) {
+            bool alpha = true, ip = true;
+            for (size_t i = dot + 1; i < host.size(); i++) if (!iswalpha(host[i])) alpha = false;
+            for (wchar_t c : host) if (!iswdigit(c) && c != L'.') ip = false;
+            if (alpha || ip) return (ip ? L"http://" : L"https://") + t;
+        }
+    }
+    return ReplaceAll(g_webSearchUrl, L"{q}", UrlEncode(t));
+}
+
+#ifdef QP_WEBVIEW
+using Microsoft::WRL::ComPtr;
+using Microsoft::WRL::Callback;
+static ComPtr<ICoreWebView2Controller> g_wvCtl;
+static ComPtr<ICoreWebView2> g_wv;
+static wstring g_webPending;
+static int g_extPending = 0;
+
+static bool UriAllowed(PWSTR uri) {
+    return uri && (_wcsnicmp(uri, L"https://", 8) == 0 || _wcsnicmp(uri, L"http://", 7) == 0 || _wcsnicmp(uri, L"about:blank", 11) == 0);
+}
+static void WebNavigate(const wstring& text) {
+    if (!g_wv) { g_webPending = text; return; }
+    wstring u = WebNormalize(text);
+    if (!u.empty()) g_wv->Navigate(u.c_str());
+}
+static void WebResize(int W, int H) {
+    if (!g_wvCtl) return;
+    RECT r = { 0, WebHdr() + 1, W, H };
+    g_wvCtl->put_Bounds(r);
+}
+static void WebStartNavigation() {
+    wstring u = g_webPending;
+    g_webPending.clear();
+    if (!u.empty()) { WebNavigate(u); if (g_wvCtl) g_wvCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC); }
+    else { SetFocus(g_hQuery); SendMessageW(g_hQuery, EM_SETSEL, 0, -1); }
+}
+static void WebGo() {
+    wstring t = GetEditText(g_hQuery);
+    g_addrDirty = false;
+    WebNavigate(t);
+    if (g_wvCtl) g_wvCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+}
+static void WebBack() { if (g_wv) g_wv->GoBack(); }
+static void WebFwd() { if (g_wv) g_wv->GoForward(); }
+static void WebReload() { if (g_wv) { if (g_webLoading) g_wv->Stop(); else g_wv->Reload(); } }
+
+static void WebSetup() {
+    if (!g_wvCtl) return;
+    g_wvCtl->get_CoreWebView2(&g_wv);
+    if (!g_wv) return;
+    { int W, H; ClientWH(W, H); WebResize(W, H); }
+    g_wvCtl->put_IsVisible(TRUE);
+
+    ComPtr<ICoreWebView2Settings> st;
+    g_wv->get_Settings(&st);
+    if (st) {
+        st->put_AreDevToolsEnabled(FALSE);
+        st->put_IsStatusBarEnabled(TRUE);
+        st->put_IsZoomControlEnabled(TRUE);
+        ComPtr<ICoreWebView2Settings4> s4;
+        if (SUCCEEDED(st.As(&s4))) { s4->put_IsPasswordAutosaveEnabled(FALSE); s4->put_IsGeneralAutofillEnabled(FALSE); }
+    }
+    ComPtr<ICoreWebView2_19> w19;
+    if (SUCCEEDED(g_wv.As(&w19))) w19->put_MemoryUsageTargetLevel(COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW);
+
+    EventRegistrationToken tk;
+    g_wv->add_NavigationStarting(Callback<ICoreWebView2NavigationStartingEventHandler>(
+        [](ICoreWebView2*, ICoreWebView2NavigationStartingEventArgs* a) -> HRESULT {
+            PWSTR uri = nullptr;
+            a->get_Uri(&uri);
+            bool ok = UriAllowed(uri);
+            if (uri) CoTaskMemFree(uri);
+            if (!ok) a->put_Cancel(TRUE);   // only http / https pages
+            else { g_webLoading = 1; InvalidateRect(g_hwnd, nullptr, FALSE); }
+            return S_OK;
+        }).Get(), &tk);
+    g_wv->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
+        [](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
+            g_webLoading = 0; InvalidateRect(g_hwnd, nullptr, FALSE); return S_OK;
+        }).Get(), &tk);
+    g_wv->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
+        [](ICoreWebView2*, ICoreWebView2SourceChangedEventArgs*) -> HRESULT {
+            PWSTR src = nullptr;
+            if (g_wv && SUCCEEDED(g_wv->get_Source(&src)) && src) {
+                if (!(g_addrDirty && GetFocus() == g_hQuery)) {
+                    g_suppress = true; SetWindowTextW(g_hQuery, src); g_suppress = false; g_addrDirty = false;
+                }
+                CoTaskMemFree(src);
+            }
+            return S_OK;
+        }).Get(), &tk);
+    g_wv->add_NewWindowRequested(Callback<ICoreWebView2NewWindowRequestedEventHandler>(   // no pop-up windows: open in this view
+        [](ICoreWebView2*, ICoreWebView2NewWindowRequestedEventArgs* a) -> HRESULT {
+            a->put_Handled(TRUE);
+            PWSTR uri = nullptr;
+            a->get_Uri(&uri);
+            if (UriAllowed(uri) && g_wv) g_wv->Navigate(uri);
+            if (uri) CoTaskMemFree(uri);
+            return S_OK;
+        }).Get(), &tk);
+    g_wv->add_PermissionRequested(Callback<ICoreWebView2PermissionRequestedEventHandler>(   // camera, mic, location, notifications: always no
+        [](ICoreWebView2*, ICoreWebView2PermissionRequestedEventArgs* a) -> HRESULT {
+            a->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY); return S_OK;
+        }).Get(), &tk);
+    ComPtr<ICoreWebView2_4> w4;
+    if (SUCCEEDED(g_wv.As(&w4)))
+        w4->add_DownloadStarting(Callback<ICoreWebView2DownloadStartingEventHandler>(
+            [](ICoreWebView2*, ICoreWebView2DownloadStartingEventArgs* a) -> HRESULT {
+                if (g_webBlockDl) { a->put_Cancel(TRUE); Balloon(L"Quick Palette", L"Downloads are blocked in the palette browser. Use your normal browser for downloads.", NIIF_INFO); }
+                return S_OK;
+            }).Get(), &tk);
+    g_wvCtl->add_AcceleratorKeyPressed(Callback<ICoreWebView2AcceleratorKeyPressedEventHandler>(
+        [](ICoreWebView2Controller*, ICoreWebView2AcceleratorKeyPressedEventArgs* a) -> HRESULT {
+            COREWEBVIEW2_KEY_EVENT_KIND kind;
+            UINT vk = 0;
+            a->get_KeyEventKind(&kind);
+            a->get_VirtualKey(&vk);
+            if (kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN) {
+                bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0;
+                UINT cmd = 0;
+                if (vk == VK_ESCAPE || (ctrl && vk == 'W')) cmd = WM_NOTE_CLOSE;
+                else if (ctrl && vk == 'L') cmd = WM_WEB_FOCUSADDR;
+                else if (alt && vk == VK_LEFT) cmd = WM_WEB_BACK;
+                else if (alt && vk == VK_RIGHT) cmd = WM_WEB_FWD;
+                else if (vk == VK_F5 || (ctrl && vk == 'R')) cmd = WM_WEB_RELOAD;
+                if (cmd) { PostMessageW(g_hwnd, cmd, 0, 0); a->put_Handled(TRUE); }
+            }
+            return S_OK;
+        }).Get(), &tk);
+
+    // optional extensions (e.g. uBlock Origin Lite), loaded before the first page
+    if (!g_webExt.empty()) {
+        ComPtr<ICoreWebView2_13> w13; ComPtr<ICoreWebView2Profile> prof; ComPtr<ICoreWebView2Profile7> p7;
+        if (SUCCEEDED(g_wv.As(&w13)) && SUCCEEDED(w13->get_Profile(&prof)) && SUCCEEDED(prof.As(&p7))) {
+            g_extPending = (int)g_webExt.size();
+            for (auto& e : g_webExt) {
+                wstring path = ExpandEnv(e);
+                HRESULT hr = p7->AddBrowserExtension(path.c_str(), Callback<ICoreWebView2ProfileAddBrowserExtensionCompletedHandler>(
+                    [](HRESULT, ICoreWebView2BrowserExtension*) -> HRESULT {
+                        if (--g_extPending <= 0) WebStartNavigation();
+                        return S_OK;
+                    }).Get());
+                if (FAILED(hr) && --g_extPending <= 0) WebStartNavigation();
+            }
+            return;
+        }
+    }
+    WebStartNavigation();
+}
+
+static void WebCreate() {
+    if (g_wvCtl) { WebStartNavigation(); return; }
+    wstring udf = g_dir + L"\\web";
+    if (g_webPrivate) WipeDir(udf);
+    CreateDirectoryW(udf.c_str(), nullptr);
+    auto opts = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+    opts->put_AdditionalBrowserArguments(L"--disable-background-networking --disable-sync --disable-breakpad --disk-cache-size=33554432");
+    if (!g_webExt.empty()) opts->put_AreBrowserExtensionsEnabled(TRUE);
+    HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), opts.Get(),
+        Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
+            [](HRESULT r, ICoreWebView2Environment* env) -> HRESULT {
+                if (FAILED(r) || !env || !g_webMode) return S_OK;
+                return env->CreateCoreWebView2Controller(g_hwnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                    [](HRESULT r2, ICoreWebView2Controller* ctl) -> HRESULT {
+                        if (!g_webMode) { if (ctl) ctl->Close(); return S_OK; }   // closed while loading
+                        if (FAILED(r2) || !ctl) { Balloon(L"Quick Palette", L"The browser could not start.", NIIF_WARNING); return S_OK; }
+                        g_wvCtl = ctl;
+                        WebSetup();
+                        return S_OK;
+                    }).Get());
+            }).Get());
+    if (FAILED(hr)) Balloon(L"Quick Palette", L"The Microsoft Edge WebView2 Runtime was not found. Install it to use the built-in browser.", NIIF_WARNING);
+}
+static void WebTeardown() {
+    if (g_wvCtl) { g_wvCtl->Close(); g_wvCtl.Reset(); }
+    g_wv.Reset();
+    g_webPending.clear();
+}
+#else
+static void WebGo() {}
+static void WebBack() {}
+static void WebFwd() {}
+static void WebReload() {}
+static void WebResize(int, int) {}
+static void WebCreate() { Balloon(L"Quick Palette", L"This build has no browser (the build step could not get the WebView2 SDK).", NIIF_WARNING); }
+static void WebTeardown() {}
+#endif
+
+static void EnterWeb(const wstring& url) {
+    g_webMode = true; g_noteMode = false; g_addrDirty = false; g_webLoading = 0;
+    g_results.clear(); g_rows.clear();
+    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);   // a layered window can show a blank web page, so drop it while browsing
+    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~(LONG_PTR)WS_EX_LAYERED);
+    g_suppress = true; SetWindowTextW(g_hQuery, url.c_str()); g_suppress = false;
+    g_query.clear(); g_qLines = 1;
+    g_lastSig = -1;
+    ApplyLayout();
+    SetFocus(g_hQuery);
+    SendMessageW(g_hQuery, EM_SETSEL, 0, -1);
+#ifdef QP_WEBVIEW
+    g_webPending = url;
+#endif
+    WebCreate();
+}
+static void ExitWeb() {
+    g_webMode = false;
+    WebTeardown();
+    g_webLoading = 0; g_addrDirty = false;
+    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
+    if (g_webPrivate) SetTimer(g_hwnd, T_WIPE, 5000, nullptr);   // wipe the profile once the browser processes have exited
+}
+
+static void DrawWeb(HDC dc, int W, int H) {
+    const Theme& T = *g_th;
+    RECT all = { 0, 0, W, H };
+    FillRectC(dc, all, T.bg);
+    HBRUSH bd = CreateSolidBrush(T.border); FrameRect(dc, &all, bd); DeleteObject(bd);
+    SetBkMode(dc, TRANSPARENT);
+    FillRound(dc, WebAddrBox(W), T.chip, px(10));
+    RECT br[3]; WebBtnRects(br);
+    bool canBack = false, canFwd = false;
+#ifdef QP_WEBVIEW
+    if (g_wv) { BOOL b = FALSE, f = FALSE; g_wv->get_CanGoBack(&b); g_wv->get_CanGoForward(&f); canBack = b != FALSE; canFwd = f != FALSE; }
+#endif
+    wchar_t gb[2] = { 0xE72B, 0 }, gf[2] = { 0xE72A, 0 }, gr[2] = { (wchar_t)(g_webLoading ? 0xE711 : 0xE72C), 0 };
+    TextAt(dc, g_fIcon, canBack ? T.text : T.thumb, gb, br[0], DT_CENTER | DT_VCENTER);
+    TextAt(dc, g_fIcon, canFwd ? T.text : T.thumb, gf, br[1], DT_CENTER | DT_VCENTER);
+    TextAt(dc, g_fIcon, T.text, gr, br[2], DT_CENTER | DT_VCENTER);
+    FillRectC(dc, { 1, WebHdr(), W - 1, WebHdr() + 1 }, T.divider);
+    if (g_webLoading) FillRectC(dc, { 1, WebHdr() - 1, W / 3, WebHdr() + 1 }, Accent(C_APP));
+    bool ready =
+#ifdef QP_WEBVIEW
+        g_wvCtl.Get() != nullptr;
+#else
+        false;
+#endif
+    if (!ready) TextAt(dc, g_fTitle, T.dim, L"Starting the browser\u2026", { 0, WebHdr() + 1, W, H }, DT_CENTER | DT_VCENTER);
+}
+static void WebMouseUp(int x, int y) {
+    RECT br[3]; WebBtnRects(br);
+    if (InRect(br[0], x, y)) WebBack();
+    else if (InRect(br[1], x, y)) WebFwd();
+    else if (InRect(br[2], x, y)) WebReload();
+}
+
 // ================================================================== show / hide / tray / window
 static void ForceForeground(HWND h) { SetForegroundWindow(h); BringWindowToTop(h); SetFocus(h); }
 
@@ -932,14 +1328,20 @@ static void ShowPalette() {
         g_anchor.x = g_work.left + ((g_work.right - g_work.left) - w) / 2;
         g_anchor.y = g_work.top + (g_work.bottom - g_work.top) * 16 / 100;
     }
+    g_lastSig = -1;
     Refresh();
+    KillTimer(g_hwnd, T_ANIM);
+    if (g_animations) { SetLayeredWindowAttributes(g_hwnd, 0, 0, LWA_ALPHA); g_animStart = GetTickCount64(); }
+    else SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
     PlaceWindow(w, PalH(), true);   // always clamped inside the screen
+    if (g_animations) SetTimer(g_hwnd, T_ANIM, 10, nullptr);
     ForceForeground(g_hwnd);
     SetFocus(g_hQuery);
 }
 
 static void HidePalette() {
     if (!IsWindowVisible(g_hwnd)) return;
+    if (g_webMode) ExitWeb();
     if (g_noteMode) { SaveNote(); ExitNote(); }
     ShowWindow(g_hwnd, SW_HIDE);
     SetTimer(g_hwnd, T_TRIM, 800, nullptr);
@@ -987,6 +1389,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_SHOWME: ShowPalette(); return 0;
         case WM_NOTE_CLOSE: HidePalette(); return 0;
+        case WM_WEB_GO: WebGo(); return 0;
+        case WM_WEB_BACK: WebBack(); return 0;
+        case WM_WEB_FWD: WebFwd(); return 0;
+        case WM_WEB_RELOAD: WebReload(); return 0;
+        case WM_WEB_FOCUSADDR: SetFocus(g_hQuery); SendMessageW(g_hQuery, EM_SETSEL, 0, -1); return 0;
         case WM_APPS_READY: {
             auto* v = (vector<AppEntry>*)lp;
             g_apps = std::move(*v); delete v;
@@ -1013,6 +1420,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLOREDIT: {
             HDC dc = (HDC)wp;
             if ((HWND)lp == g_hEditor) { SetTextColor(dc, g_th->editorText); SetBkColor(dc, g_th->editorBg); return (LRESULT)g_brEd; }
+            if (g_webMode && (HWND)lp == g_hQuery) { SetTextColor(dc, g_th->text); SetBkColor(dc, g_th->chip); return (LRESULT)g_brChip; }
             SetTextColor(dc, g_th->text); SetBkColor(dc, g_th->bg);
             return (LRESULT)g_brBg;
         }
@@ -1027,7 +1435,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(h, T_TRIM, 1500, nullptr);
             } else if (wp == T_TRIM) {
                 KillTimer(h, T_TRIM);
-                if (!IsWindowVisible(h)) SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+                if (!IsWindowVisible(h)) { FreeBackBuffer(); SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1); }
             } else if (wp == T_AUTOSAVE) {
                 SaveNote();
             } else if (wp == T_PREVIEW) {
@@ -1036,12 +1444,38 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (wp == T_FREE) {
                 KillTimer(h, T_FREE);
                 if (!IsWindowVisible(h)) { FreeFiles(); SetTimer(h, T_TRIM, 500, nullptr); }
+            } else if (wp == T_ANIM) {
+                double t = std::min(1.0, (double)(GetTickCount64() - g_animStart) / 140.0);
+                double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+                SetLayeredWindowAttributes(h, 0, (BYTE)(255.0 * e), LWA_ALPHA);
+                SetWindowPos(h, nullptr, g_winX, g_winY + (int)((1.0 - e) * px(12)), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                if (t >= 1.0) KillTimer(h, T_ANIM);
+            } else if (wp == T_SEL) {
+                double tg = SelTargetY(), d = tg - g_selY;
+                if (std::fabs(d) < 1.5) { g_selY = tg; KillTimer(h, T_SEL); } else g_selY += d * 0.4;
+                InvalidateRect(h, nullptr, FALSE);
+            } else if (wp == T_WIPE) {
+                KillTimer(h, T_WIPE);
+                if (!g_webMode && g_webPrivate) WipeDir(g_dir + L"\\web");
+            } else if (wp == T_QUERY) {
+                KillTimer(h, T_QUERY);
+                if (!g_noteMode) Refresh();
+            } else if (wp >= 100) {   // user timers / reminders
+                KillTimer(h, (UINT_PTR)wp);
+                for (size_t i = 0; i < g_timers.size(); i++)
+                    if (g_timers[i].id == wp) {
+                        Balloon(L"Timer finished", g_timers[i].label.c_str(), NIIF_INFO);
+                        MessageBeep(MB_ICONASTERISK);
+                        g_timers.erase(g_timers.begin() + (std::ptrdiff_t)i);
+                        break;
+                    }
             }
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) { if (!g_menuOpen && g_hideOnFocusLoss) HidePalette(); }
             else if (IsWindowVisible(h)) {
-                if (g_noteMode) { if (g_hEditor && g_noteView != 2) SetFocus(g_hEditor); }
+                if (g_webMode) {}   // keep focus wherever the user put it (address bar or page)
+                else if (g_noteMode) { if (g_hEditor && g_noteView != 2) SetFocus(g_hEditor); }
                 else if (g_hQuery) SetFocus(g_hQuery);
             }
             return 0;
@@ -1052,12 +1486,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(h, &ps);
             RECT rc; GetClientRect(h, &rc);
-            HDC m = CreateCompatibleDC(dc);
-            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-            HGDIOBJ old = SelectObject(m, bmp);
-            if (g_noteMode) DrawNote(m, rc.right, rc.bottom); else DrawPalette(m, rc.right, rc.bottom);
+            HDC m = GetBackBuffer(dc, rc.right, rc.bottom);
+            if (g_webMode) DrawWeb(m, rc.right, rc.bottom); else if (g_noteMode) DrawNote(m, rc.right, rc.bottom); else DrawPalette(m, rc.right, rc.bottom);
             BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
-            SelectObject(m, old); DeleteObject(bmp); DeleteDC(m);
             EndPaint(h, &ps);
             return 0;
         }
@@ -1065,7 +1496,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (LOWORD(lp) == HTCLIENT) {
                 POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
                 bool hand = false;
-                if (g_noteMode) {
+                if (g_webMode) {
+                    RECT wb[3]; WebBtnRects(wb);
+                    for (int i = 0; i < 3; i++) if (InRect(wb[i], p.x, p.y)) hand = true;
+                } else if (g_noteMode) {
                     int lx, ly, W, H; RECT bt[3];
                     if (PvPoint(p.x, p.y, lx, ly)) hand = g_md.HitLink(lx, ly) >= 0 || g_md.HitTask(lx, ly) >= 0;
                     if (!hand && ChipAt(p.x, p.y) >= 0) hand = true;
@@ -1110,6 +1544,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                     int thH = th.bottom - th.top;
                     g_scroll = g_dragScroll + (int)((long long)(y - g_dragY) * (ContentH() - ListH()) / std::max<int>(1, (tr.bottom - tr.top) - thH));
                     ClampListScroll();
+                    SnapSel();
                     InvalidateRect(h, nullptr, FALSE);
                 }
                 return 0;
@@ -1127,7 +1562,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             ScreenToClient(h, &p);
             if (g_noteMode) NoteWheel(d, p.x, p.y);
-            else { g_scroll -= d * ItemH() / WHEEL_DELTA; ClampListScroll(); InvalidateRect(h, nullptr, FALSE); }
+            else { g_scroll -= d * ItemH() / WHEEL_DELTA; ClampListScroll(); SnapSel(); InvalidateRect(h, nullptr, FALSE); }
             return 0;
         }
         case WM_LBUTTONDOWN: {
@@ -1141,6 +1576,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_LBUTTONUP: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            if (g_webMode) { WebMouseUp(x, y); return 0; }
             if (g_noteMode) { NoteMouseUp(x, y); return 0; }
             if (g_drag) { g_drag = 0; ReleaseCapture(); return 0; }
             int i = HitTest(y);
@@ -1198,6 +1634,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_hiddenPath = g_dir + L"\\hidden.txt";
     g_appsPath = g_dir + L"\\apps.txt";
     g_filesPath = g_dir + L"\\files.txt";
+    g_pinsPath = g_dir + L"\\pins.txt";
     SetUnhandledExceptionFilter(OnCrash);
 
     HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\QuickPalette.v2");
@@ -1224,8 +1661,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
 
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kClass, L"Quick Palette", WS_POPUP | WS_CLIPCHILDREN, 0, 0, px(640), px(60), nullptr, nullptr, inst, nullptr);
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kClass, L"Quick Palette", WS_POPUP | WS_CLIPCHILDREN, 0, 0, px(640), px(60), nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
+    SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
     int pref = 2;   // rounded corners (only succeeds on Windows 11)
     g_win11 = SUCCEEDED(DwmSetWindowAttribute(g_hwnd, 33, &pref, sizeof pref));
     ApplyTheme();
