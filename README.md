@@ -38,11 +38,16 @@ calculator, unit conversion, and a Markdown note editor with live preview.
 | Ctrl+Shift+C | copy the path of a file result |
 
 ## Built-in browser (`w `)
-- Type `w` and a space: the search box becomes an address bar. Type a site or search words, press Enter. Esc closes it.
+- Type `w` and a space: a start page appears instantly (tiles for your favorite sites, Alt+1..8 opens one) and the search box
+  becomes an address bar. Type a site or search words (Google by default), press Enter. Esc closes it.
+- The engine warms up while you pause on `w`, and stays warm for 45 s after closing so reopening is instant, then exits completely.
 - Needs the Microsoft Edge WebView2 Runtime (already on most Windows 10/11 PCs).
 - It exists only while open: closing it ends every browser process and (by default) wipes cookies, cache and history.
-- Safety: only http/https pages, no downloads, camera/mic/location/notification requests are denied, no pop-up windows,
-  DevTools and password/autofill saving are off.
+- Safety: https-only (http upgraded), certificate errors can't be clicked through, only http/https pages, no downloads,
+  camera/mic/location/notification requests denied, no pop-ups, pages can't launch other programs, strict tracking prevention,
+  built-in ad/tracker blocking, SmartScreen on, DevTools and password/autofill saving off.
+- Memory: several `msedgewebview2.exe` processes are normal (browser, GPU, network, one per site). `web_lowram=1` trims them
+  at the cost of isolation and speed.
 - Extensions (such as uBlock Origin Lite): unzip the extension and add `web_extension=C:\path\to\folder` to config.ini.
   WebView2 only supports part of the extension system, so this is best-effort.
 - Keys: Enter go, Alt+Left/Right back/forward, F5 reload, Ctrl+L address bar, Esc close. Command "Clear browser data".

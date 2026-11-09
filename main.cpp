@@ -79,7 +79,7 @@ static HWND g_hwnd;
 static const wchar_t* kClass = L"QuickPaletteWnd";
 static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3, WM_FILES_READY = WM_APP + 4;
 static UINT g_wmTaskbar;
-enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_PREVIEW = 4, T_FREE = 5, T_ANIM = 6, T_SEL = 7, T_QUERY = 8, T_WIPE = 9 };
+enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_PREVIEW = 4, T_FREE = 5, T_ANIM = 6, T_SEL = 7, T_QUERY = 8, T_WIPE = 9, T_PROG = 10, T_WEBFREE = 11, T_PREWARM = 12 };
 
 static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath, g_filesPath;
 static wstring g_hotkey = L"Ctrl+Space", g_defaultBang = L"g";
@@ -110,10 +110,14 @@ static wstring g_themeMode = L"auto", g_noteFont = L"Consolas", g_noteViewCfg = 
 static wstring g_fileSkip = L"node_modules|.git|$RECYCLE.BIN|System Volume Information";
 static bool g_animations = true, g_showNumbers = true;
 static wstring g_windowTrigger = L"sw", g_pinsPath;
-static wstring g_webTrigger = L"w", g_webSearchUrl = L"https://duckduckgo.com/?q={q}";
+static wstring g_webTrigger = L"w", g_webSearchUrl = L"https://www.google.com/search?q={q}";
 static vector<wstring> g_webExt;
 static int g_webW = 1100, g_webH = 720;
-static bool g_webPrivate = true, g_webBlockDl = true;
+static bool g_webPrivate = true, g_webBlockDl = true, g_webHttpsOnly = true, g_webLowRam = false, g_webPrewarm = true;
+static int g_webKeepAlive = 45;   // seconds the browser stays warm after closing (instant reopen), then fully exits
+static vector<wstring> g_webBlock;
+struct WebMark { wstring name, url; };
+static vector<WebMark> g_webMarks;
 static std::unordered_set<wstring> g_pins;
 static vector<std::pair<wstring, wstring>> g_alias;   // extra search word -> item title
 struct TimerRec { UINT id; wstring label; };
@@ -311,7 +315,19 @@ static void DefaultConfig() {
         L"# The search box becomes the address bar. Enter loads the page right here. Esc closes it.\n"
         L"web_trigger=w\n"
         L"# used when you type words instead of a website address\n"
-        L"web_search=https://duckduckgo.com/?q={q}\n"
+        L"web_search=https://www.google.com/search?q={q}\n"
+        L"# only https pages (http is upgraded; sites without https show an error). 0 = allow plain http\n"
+        L"web_https_only=1\n"
+        L"# warm up the browser while you type  w  so it opens instantly (1 = on)\n"
+        L"web_prewarm=1\n"
+        L"# seconds the browser stays warm after you close it (instant reopen), then it exits completely and frees all RAM\n"
+        L"web_keepalive=45\n"
+        L"# 1 = fewer browser processes and a smaller memory budget, but weaker isolation and slower heavy pages\n"
+        L"web_lowram=0\n"
+        L"# extra domains to block (ads/trackers are already blocked). e.g. web_block=annoying-ads.example\n"
+        L"# web_block=example-tracker.com\n"
+        L"# start-page tiles (up to 8): web_bookmark=Name|https://address\n"
+        L"# web_bookmark=News|https://news.google.com\n"
         L"web_width=1100\n"
         L"web_height=720\n"
         L"# 1 = forget cookies/history/cache every time the browser closes (lightest, most private)\n"
@@ -349,7 +365,7 @@ static void LoadConfig() {
     if (!PathFileExistsW(g_cfgPath.c_str())) { DefaultConfig(); g_firstRun = true; }
     vector<wstring> lines;
     ReadLines(g_cfgPath, lines);
-    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear(); g_notes.clear(); g_alias.clear(); g_webExt.clear();
+    g_bangs.clear(); g_cmds.clear(); g_folders.clear(); g_snippets.clear(); g_notes.clear(); g_alias.clear(); g_webExt.clear(); g_webBlock.clear(); g_webMarks.clear();
     for (auto& raw : lines) {
         wstring l = Trim(raw);
         if (l.empty() || l[0] == L'#') continue;
@@ -385,6 +401,15 @@ static void LoadConfig() {
         else if (k == L"web_width") g_webW = std::max(560, std::min(2400, _wtoi(v.c_str())));
         else if (k == L"web_height") g_webH = std::max(400, std::min(1600, _wtoi(v.c_str())));
         else if (k == L"web_private") g_webPrivate = (v != L"0");
+        else if (k == L"web_https_only") g_webHttpsOnly = (v != L"0");
+        else if (k == L"web_lowram") g_webLowRam = (v == L"1");
+        else if (k == L"web_prewarm") g_webPrewarm = (v != L"0");
+        else if (k == L"web_keepalive") g_webKeepAlive = std::max(0, std::min(600, _wtoi(v.c_str())));
+        else if (k == L"web_block") { if (!v.empty()) g_webBlock.push_back(v); }
+        else if (k == L"web_bookmark") {
+            size_t b = v.find(L'|');
+            if (b != wstring::npos && b > 0) g_webMarks.push_back({ Trim(v.substr(0, b)), Trim(v.substr(b + 1)) });
+        }
         else if (k == L"web_block_downloads") g_webBlockDl = (v != L"0");
         else if (k == L"alias") {
             size_t b = v.find(L'|');
@@ -412,6 +437,11 @@ static void LoadConfig() {
         }
     }
     if (g_notes.empty()) g_notes.push_back({ L"n", L"Notes", L"Documents\\QuickNotes.md" });
+    if (g_webMarks.empty()) {
+        g_webMarks = { { L"Google", L"https://www.google.com" }, { L"YouTube", L"https://www.youtube.com" }, { L"Gmail", L"https://mail.google.com" },
+                       { L"Maps", L"https://www.google.com/maps" }, { L"GitHub", L"https://github.com" }, { L"Wikipedia", L"https://en.wikipedia.org" },
+                       { L"Reddit", L"https://www.reddit.com" }, { L"News", L"https://news.google.com" } };
+    }
     g_cfgStamp = Stamp(g_cfgPath);
     g_catalogDirty = true;
 }
@@ -679,6 +709,14 @@ static void BuildCatalog() {
         { L"anim-off", L"Animations: off", L"Instant, no effects", L"animations", L"0" },
         { L"footer-on", L"Footer hints: show", L"Key hints under the list", L"show_footer", L"1" },
         { L"footer-off", L"Footer hints: hide", L"Hide the key hints", L"show_footer", L"0" },
+        { L"web-google", L"Browser search: Google", L"Use Google for words typed in the browser", L"web_search", L"https://www.google.com/search?q={q}" },
+        { L"web-ddg", L"Browser search: DuckDuckGo", L"Use DuckDuckGo for words typed in the browser", L"web_search", L"https://duckduckgo.com/?q={q}" },
+        { L"web-bing", L"Browser search: Bing", L"Use Bing for words typed in the browser", L"web_search", L"https://www.bing.com/search?q={q}" },
+        { L"web-brave", L"Browser search: Brave", L"Use Brave Search for words typed in the browser", L"web_search", L"https://search.brave.com/search?q={q}" },
+        { L"web-lowram-on", L"Browser low-RAM mode: on", L"Fewer processes, smaller memory (less isolation)", L"web_lowram", L"1" },
+        { L"web-lowram-off", L"Browser low-RAM mode: off", L"Full process isolation (default)", L"web_lowram", L"0" },
+        { L"web-https-on", L"Browser HTTPS-only: on", L"Upgrade http to https, refuse plain http", L"web_https_only", L"1" },
+        { L"web-https-off", L"Browser HTTPS-only: off", L"Allow plain http pages", L"web_https_only", L"0" },
     };
     for (auto& t : tg) Add(v, wstring(L"cfg:") + t.id, t.title, t.sub, L"setting option preference customize appearance", C_CMD, 0xE713, K_CFG, t.key, t.val);
 
