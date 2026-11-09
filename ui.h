@@ -21,7 +21,7 @@ static const Theme* g_th = &kDark;
 static HWND g_hQuery = nullptr, g_hEditor = nullptr;
 static WNDPROC g_oldQuery = nullptr, g_oldEditor = nullptr;
 static HBRUSH g_brBg = nullptr, g_brEd = nullptr, g_brChip = nullptr;
-static bool g_webMode = false, g_addrDirty = false;
+static bool g_webMode = false, g_addrDirty = false, g_webPage = false;
 static HFONT g_fChip = nullptr, g_fNoteHead = nullptr, g_fNote = nullptr;
 static bool g_win11 = false, g_noteMode = false, g_suppress = false, g_facesChecked = false, g_lastCompact = false;
 static int g_lineH = 28, g_qLines = 1;
@@ -1038,7 +1038,7 @@ static void NoteWheel(int delta, int x, int y) {
 // Start page is drawn by us (instant). The real browser warms up in the background while you type,
 // stays warm briefly after closing, then exits completely so it uses no RAM.
 static int g_webLoading = 0, g_webHover = -1, g_btnHover = -1, g_progT = 0;
-static bool g_webPage = false, g_webSecure = false, g_webWarm = false, g_webReady = false, g_webCreating = false;
+static bool g_webSecure = false, g_webWarm = false, g_webReady = false, g_webCreating = false;
 
 static RECT WebAddrBox(int W) { return { px(150), px(8), W - px(12), WebHdr() - px(8) }; }
 static void WebBtnRects(RECT r[4]) {
