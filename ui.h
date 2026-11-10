@@ -21,10 +21,13 @@ static const Theme* g_th = &kDark;
 static HWND g_hQuery = nullptr, g_hEditor = nullptr;
 static WNDPROC g_oldQuery = nullptr, g_oldEditor = nullptr;
 static HBRUSH g_brBg = nullptr, g_brEd = nullptr, g_brChip = nullptr;
-static bool g_webMode = false, g_addrDirty = false, g_webPage = false;
+static bool g_webMode = false, g_addrDirty = false, g_webPage = false;   // g_noteMode/g_webMode: legacy, always false (notes and browser are separate windows now)
+static HWND g_nw = nullptr, g_ww = nullptr, g_hAddr = nullptr;           // note window, browser window, address bar
+static WNDPROC g_oldAddr = nullptr;
+static bool g_noteOpen = false, g_webOpen = false;
 static HFONT g_fChip = nullptr, g_fNoteHead = nullptr, g_fNote = nullptr;
 static bool g_win11 = false, g_noteMode = false, g_suppress = false, g_facesChecked = false, g_lastCompact = false;
-static int g_lineH = 28, g_qLines = 1;
+static int g_lineH = 28, g_qLines = 1, g_addrH = 22;
 static RECT g_work = { 0, 0, 1920, 1080 };
 static POINT g_anchor = { 0, 0 };
 static wchar_t g_uiFace[64] = L"Segoe UI", g_iconFace[64] = L"Segoe MDL2 Assets";
@@ -121,10 +124,14 @@ static void SetDpi(int dpi, bool force = false) {
     HDC dc = GetDC(nullptr);
     HGDIOBJ o = SelectObject(dc, g_fSearch);
     TEXTMETRICW tm; GetTextMetricsW(dc, &tm);
-    SelectObject(dc, o); ReleaseDC(nullptr, dc);
     g_lineH = tm.tmHeight + tm.tmExternalLeading;
+    SelectObject(dc, g_fTitle);
+    GetTextMetricsW(dc, &tm);
+    g_addrH = tm.tmHeight + tm.tmExternalLeading + px(2);
+    SelectObject(dc, o); ReleaseDC(nullptr, dc);
     g_lastCompact = g_compact;
     if (g_hQuery) SendMessageW(g_hQuery, WM_SETFONT, (WPARAM)g_fSearch, TRUE);
+    if (g_hAddr) SendMessageW(g_hAddr, WM_SETFONT, (WPARAM)g_fTitle, TRUE);
 }
 
 // ------------------------------------------------------------------ palette metrics
@@ -267,10 +274,10 @@ static void RunSelected() {
         HidePalette();
         return;
     }
-    if (it.kind == K_BROWSE) { EnterWeb(it.a); return; }
+    if (it.kind == K_BROWSE) { EnterWeb(it.a); HidePalette(); return; }
     if (it.kind == K_NOTE) {
         for (size_t i = 0; i < g_notes.size(); i++)
-            if (_wcsicmp(g_notes[i].trig.c_str(), it.a.c_str()) == 0) { EnterNote((int)i); return; }
+            if (_wcsicmp(g_notes[i].trig.c_str(), it.a.c_str()) == 0) { EnterNote((int)i); HidePalette(); return; }
         return;
     }
     HidePalette();
@@ -296,8 +303,8 @@ static void OnQueryChanged() {
     if (!g_webTrigger.empty() && low == lower(g_webTrigger)) SetTimer(g_hwnd, T_PREWARM, 150, nullptr);   // paused on "w": warm the browser
     else KillTimer(g_hwnd, T_PREWARM);
     for (size_t i = 0; i < g_notes.size(); i++)
-        if (low == lower(g_notes[i].trig) + L" ") { EnterNote((int)i); return; }   // "n " turns the box into the note editor
-    if (!g_webTrigger.empty() && low == lower(g_webTrigger) + L" ") { EnterWeb(L""); return; }   // "w " opens the browser
+        if (low == lower(g_notes[i].trig) + L" ") { EnterNote((int)i); HidePalette(); return; }   // "n " turns the box into the note editor
+    if (!g_webTrigger.empty() && low == lower(g_webTrigger) + L" ") { EnterWeb(L""); HidePalette(); return; }   // "w " opens the browser
     g_query = raw;
     for (auto& c : g_query) if (c == L'\r' || c == L'\n') c = L' ';
     int lines = (int)SendMessageW(g_hQuery, EM_GETLINECOUNT, 0, 0);
@@ -544,6 +551,7 @@ static int g_drag = 0, g_dragY = 0, g_dragScroll = 0;   // 1 = list thumb, 2 = p
 static int NHdr() { return px(46); }
 static int NStat() { return px(40); }
 static void ClientWH(int& W, int& H) { RECT rc; GetClientRect(g_hwnd, &rc); W = rc.right; H = rc.bottom; }
+static void ClientWHw(HWND hh, int& W, int& H) { RECT rc; GetClientRect(hh, &rc); W = rc.right; H = rc.bottom; }
 static RECT NoteBody(int W, int H) { return { 0, NHdr() + 1, W, H - NStat() }; }
 static RECT EditorArea(int W, int H) { RECT r = NoteBody(W, H); if (g_noteView == 1) r.right = W / 2; return r; }
 static RECT PreviewArea(int W, int H) { RECT r = NoteBody(W, H); if (g_noteView == 1) r.left = W / 2 + 1; return r; }
@@ -596,7 +604,7 @@ static void BuildChipOrder() {
     });
 }
 static void LayoutChips() {
-    HDC dc = GetDC(g_hwnd);
+    HDC dc = GetDC(g_nw);
     HGDIOBJ o = SelectObject(dc, g_fChip);
     g_chipRects.assign(g_chipOrder.size(), RECT{ 0, 0, 0, 0 });
     int x = px(12), h = px(26);
@@ -608,14 +616,14 @@ static void LayoutChips() {
         x += w + px(6);
     }
     g_chipTotalW = x;
-    SelectObject(dc, o); ReleaseDC(g_hwnd, dc);
-    int W, H; ClientWH(W, H);
+    SelectObject(dc, o); ReleaseDC(g_nw, dc);
+    int W, H; ClientWHw(g_nw, W, H);
     g_chipScroll = std::max(0, std::min(g_chipScroll, std::max(0, g_chipTotalW - (W - px(12)))));
 }
 
 // ---- preview
 static bool PvThumb(RECT& track, RECT& thumb) {
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     RECT pa = PreviewArea(W, H);
     int vh = pa.bottom - pa.top;
     if (g_pvH <= vh) return false;
@@ -626,22 +634,22 @@ static bool PvThumb(RECT& track, RECT& thumb) {
     return true;
 }
 static void ClampPv() {
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     RECT pa = PreviewArea(W, H);
     g_pvScroll = std::max<int>(0, std::min<int>(g_pvScroll, std::max<int>(0, g_pvH - (pa.bottom - pa.top))));
 }
 static void LayoutPreview() {
-    if (!g_noteMode || g_noteView == 0) return;
-    int W, H; ClientWH(W, H);
+    if (!g_noteOpen || g_noteView == 0) return;
+    int W, H; ClientWHw(g_nw, W, H);
     RECT pa = PreviewArea(W, H);
-    HDC dc = GetDC(g_hwnd);
+    HDC dc = GetDC(g_nw);
     g_md.Layout(dc, (pa.right - pa.left) - px(10), px(15));
-    ReleaseDC(g_hwnd, dc);
+    ReleaseDC(g_nw, dc);
     g_pvH = g_md.height;
     ClampPv();
 }
 static void RebuildPreview(bool follow) {
-    if (!g_noteMode || !g_hEditor) return;
+    if (!g_noteOpen || !g_hEditor) return;
     wstring t = GetEditText(g_hEditor);
     size_t words = 0; bool in = false;
     for (wchar_t c : t) { bool sp = iswspace(c) != 0; if (!sp && !in) words++; in = !sp; }
@@ -650,7 +658,7 @@ static void RebuildPreview(bool follow) {
         g_md.Parse(t);
         LayoutPreview();
         if (follow && g_noteView == 1) {
-            int W, H; ClientWH(W, H);
+            int W, H; ClientWHw(g_nw, W, H);
             RECT pa = PreviewArea(W, H);
             int vh = pa.bottom - pa.top;
             if (g_pvH > vh) {
@@ -662,27 +670,23 @@ static void RebuildPreview(bool follow) {
             }
         }
     }
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    InvalidateRect(g_nw, nullptr, FALSE);
 }
 static void OnNoteChanged() {
-    if (g_suppress || !g_noteMode) return;
+    if (g_suppress || !g_noteOpen) return;
     g_noteDirty = true;
-    SetTimer(g_hwnd, T_AUTOSAVE, 2500, nullptr);
-    SetTimer(g_hwnd, T_PREVIEW, 150, nullptr);
+    SetTimer(g_nw, T_AUTOSAVE, 2500, nullptr);
+    SetTimer(g_nw, T_PREVIEW, 150, nullptr);
 }
 
-static void LayoutChildren() {
+static void LayoutChildren() {   // the palette's own layout (search box)
     int W, H; ClientWH(W, H);
-    if (g_webMode) {   // the search box becomes the address bar
-        MoveWindow(g_hQuery, px(150) + px(40), (WebHdr() - g_lineH) / 2, W - (px(150) + px(40)) - px(24), g_lineH, TRUE);
-        WebResize(W, H);
-        return;
-    }
-    if (!g_noteMode) {
-        int eh = g_qLines * g_lineH;
-        MoveWindow(g_hQuery, px(52), (SearchH() - eh) / 2, W - px(52) - px(20), eh, TRUE);
-        return;
-    }
+    int eh = g_qLines * g_lineH;
+    MoveWindow(g_hQuery, px(52), (SearchH() - eh) / 2, W - px(52) - px(20), eh, TRUE);
+}
+static void NoteLayout() {   // the note window's layout
+    if (!g_noteOpen || !g_nw) return;
+    int W, H; ClientWHw(g_nw, W, H);
     if (g_hEditor) {
         if (g_noteView == 2) ShowWindow(g_hEditor, SW_HIDE);
         else {
@@ -693,21 +697,20 @@ static void LayoutChildren() {
     }
     LayoutChips();
     LayoutPreview();
+    InvalidateRect(g_nw, nullptr, FALSE);
 }
-
 static void SetView(int v) {
     g_noteView = v;
-    g_lastSig = -1;
-    ApplyLayout();
+    NoteLayout();
     RebuildPreview(false);
-    if (v == 2) SetFocus(g_hwnd); else if (g_hEditor) SetFocus(g_hEditor);
+    if (v == 2) SetFocus(g_nw); else if (g_hEditor) SetFocus(g_hEditor);
 }
 static void CycleView() { SetView((g_noteView + 1) % 3); }
 
 // ---- load / save
 static void SaveNote() {
-    if (!g_noteMode || !g_hEditor) return;
-    KillTimer(g_hwnd, T_AUTOSAVE);
+    if (!g_noteOpen || !g_hEditor) return;
+    KillTimer(g_nw, T_AUTOSAVE);
     if (g_noteDirty) {
         wstring t = GetEditText(g_hEditor);
         if (g_noteLF) t = ReplaceAll(t, L"\r\n", L"\n");
@@ -724,14 +727,19 @@ static void SaveNote() {
 
 static LRESULT CALLBACK EditorProc(HWND h, UINT m, WPARAM w, LPARAM l);
 
-static void EnterNote(int idx) {
-    if (idx < 0 || idx >= (int)g_notes.size()) return;
-    g_noteIdx = idx; g_noteMode = true;
+static HWND MakeToolWindow(const wchar_t* title, int w96, int h96);
+
+static void NoteContentClose() {   // free the editor, preview and fonts (the window itself stays)
+    if (g_nw) { KillTimer(g_nw, T_AUTOSAVE); KillTimer(g_nw, T_PREVIEW); }
+    if (g_hEditor) { DestroyWindow(g_hEditor); g_hEditor = nullptr; g_oldEditor = nullptr; }
+    if (g_fNote) { DeleteObject(g_fNote); g_fNote = nullptr; }
+    g_md.Clear(); g_chipRects.clear(); g_noteStats.clear(); g_drag = 0;
+}
+
+static void NoteLoad(int idx) {
+    g_noteIdx = idx;
     g_noteView = g_noteViewCfg == L"edit" ? 0 : g_noteViewCfg == L"preview" ? 2 : 1;
     g_notePath = ExpandNotePath(g_notes[idx].path);
-    g_suppress = true; SetWindowTextW(g_hQuery, L""); g_suppress = false;
-    g_query.clear(); g_qLines = 1; g_results.clear(); g_rows.clear();
-    ShowWindow(g_hQuery, SW_HIDE);
 
     wstring txt;
     bool had = ReadFileUtf8(g_notePath, txt, 4u * 1024 * 1024);
@@ -740,7 +748,7 @@ static void EnterNote(int idx) {
 
     g_fNote = MakeFont(px(g_noteFontSize), 400, g_noteFont.c_str());
     g_hEditor = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
-                                0, 0, 100, 100, g_hwnd, (HMENU)(INT_PTR)102, g_inst, nullptr);
+                                0, 0, 100, 100, g_nw, (HMENU)(INT_PTR)102, g_inst, nullptr);
     SendMessageW(g_hEditor, WM_SETFONT, (WPARAM)g_fNote, TRUE);
     SendMessageW(g_hEditor, EM_LIMITTEXT, 4000000, 0);
     SetWindowTheme(g_hEditor, g_th->dark ? L"DarkMode_Explorer" : L"Explorer", nullptr);
@@ -753,20 +761,32 @@ static void EnterNote(int idx) {
     LoadChipCounts(); BuildChipOrder();
     g_md.Clear(); g_md.bodyFace = g_uiFace; g_md.monoFace = g_noteFont;
     g_pvScroll = 0; g_chipScroll = 0; g_chipHot = -1;
-    g_lastSig = -1;
-    ApplyLayout();
+    SetWindowTextW(g_nw, (g_notes[idx].name + L" \u2014 Quick Palette").c_str());
+    NoteLayout();
     RebuildPreview(false);
-    if (g_noteView == 2) SetFocus(g_hwnd); else SetFocus(g_hEditor);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    if (g_noteView == 2) SetFocus(g_nw); else SetFocus(g_hEditor);
 }
 
-static void ExitNote() {
-    KillTimer(g_hwnd, T_AUTOSAVE); KillTimer(g_hwnd, T_PREVIEW);
-    if (g_hEditor) { DestroyWindow(g_hEditor); g_hEditor = nullptr; g_oldEditor = nullptr; }
-    if (g_fNote) { DeleteObject(g_fNote); g_fNote = nullptr; }
-    g_md.Clear();
-    g_noteMode = false; g_noteIdx = -1; g_chipRects.clear(); g_noteStats.clear(); g_drag = 0;
-    ShowWindow(g_hQuery, SW_SHOW);
+static void EnterNote(int idx) {
+    if (idx < 0 || idx >= (int)g_notes.size()) return;
+    if (g_noteOpen && g_nw) {   // already open: switch note if needed, then bring it forward
+        if (g_noteIdx != idx) { SaveNote(); NoteContentClose(); NoteLoad(idx); }
+        if (IsIconic(g_nw)) ShowWindow(g_nw, SW_RESTORE);
+        SetForegroundWindow(g_nw);
+        return;
+    }
+    g_nw = MakeToolWindow(L"Notes", g_noteW, g_noteH);
+    if (!g_nw) return;
+    g_noteOpen = true;
+    NoteLoad(idx);
+    ShowWindow(g_nw, SW_SHOW);
+    SetForegroundWindow(g_nw);
+    if (g_hEditor && g_noteView != 2) SetFocus(g_hEditor);
+}
+
+static void ExitNote() {   // the note window was destroyed
+    NoteContentClose();
+    g_noteOpen = false; g_noteIdx = -1; g_nw = nullptr;
 }
 
 // ---- inserting markdown syntax at the cursor (clicking a chip, or typing shortcuts)
@@ -864,7 +884,7 @@ static LRESULT CALLBACK EditorProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
         case WM_KEYDOWN: {
             bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
-            if (w == VK_ESCAPE) { PostMessageW(g_hwnd, WM_NOTE_CLOSE, 0, 0); return 0; }   // save + close palette
+
             if (ctrl) {
                 if (w == 'S') { SaveNote(); return 0; }
                 if (w == 'P') { CycleView(); return 0; }
@@ -945,7 +965,7 @@ static void DrawNote(HDC dc, int W, int H) {
 // ---- mouse in note mode
 static bool InRect(const RECT& r, int x, int y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 static int ChipAt(int x, int y) {
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     int sy = H - NStat(), ch = px(26), cy = sy + (NStat() - ch) / 2;
     if (y < cy || y >= cy + ch) return -1;
     for (size_t k = 0; k < g_chipRects.size(); k++)
@@ -970,7 +990,7 @@ static void ToggleTask(int pos) {
 }
 static bool PvPoint(int x, int y, int& lx, int& ly) {   // client -> layout coordinates, false if outside the preview
     if (g_noteView == 0) return false;
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     RECT pa = PreviewArea(W, H);
     if (!InRect(pa, x, y)) return false;
     lx = x - pa.left; ly = y - pa.top + g_pvScroll;
@@ -979,19 +999,19 @@ static bool PvPoint(int x, int y, int& lx, int& ly) {   // client -> layout coor
 static void NoteMouseDown(int x, int y) {
     RECT tr, th;
     if (PvThumb(tr, th) && x >= tr.left - px(4) && x < tr.right + px(4) && y >= tr.top && y < tr.bottom) {
-        g_drag = 2; g_dragY = y; g_dragScroll = g_pvScroll; SetCapture(g_hwnd);
+        g_drag = 2; g_dragY = y; g_dragScroll = g_pvScroll; SetCapture(g_nw);
         if (!InRect(th, x, y)) {   // clicked the track: jump there
-            int vh; { int W, H; ClientWH(W, H); RECT pa = PreviewArea(W, H); vh = pa.bottom - pa.top; }
+            int vh; { int W, H; ClientWHw(g_nw, W, H); RECT pa = PreviewArea(W, H); vh = pa.bottom - pa.top; }
             int thH = th.bottom - th.top;
             g_pvScroll = (int)((long long)(y - tr.top - thH / 2) * (g_pvH - vh) / std::max<int>(1, (tr.bottom - tr.top) - thH));
             ClampPv(); g_dragY = y; g_dragScroll = g_pvScroll;
-            InvalidateRect(g_hwnd, nullptr, FALSE);
+            InvalidateRect(g_nw, nullptr, FALSE);
         }
     }
 }
 static void NoteMouseUp(int x, int y) {
     if (g_drag) { g_drag = 0; ReleaseCapture(); return; }
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     RECT bt[3]; BtnRects(W, bt);
     for (int i = 0; i < 3; i++) if (InRect(bt[i], x, y)) { if (g_noteView != i) SetView(i); return; }
     int k = ChipAt(x, y);
@@ -1008,28 +1028,28 @@ static void NoteMouseMove(int x, int y) {
     if (g_drag == 2) {
         RECT tr, th;
         if (PvThumb(tr, th)) {
-            int W, H; ClientWH(W, H);
+            int W, H; ClientWHw(g_nw, W, H);
             RECT pa = PreviewArea(W, H);
             int vh = pa.bottom - pa.top, thH = th.bottom - th.top;
             g_pvScroll = g_dragScroll + (int)((long long)(y - g_dragY) * (g_pvH - vh) / std::max<int>(1, (tr.bottom - tr.top) - thH));
             ClampPv();
-            InvalidateRect(g_hwnd, nullptr, FALSE);
+            InvalidateRect(g_nw, nullptr, FALSE);
         }
         return;
     }
     int hot = ChipAt(x, y);
-    if (hot != g_chipHot) { g_chipHot = hot; InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (hot != g_chipHot) { g_chipHot = hot; InvalidateRect(g_nw, nullptr, FALSE); }
 }
 static void NoteWheel(int delta, int x, int y) {
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_nw, W, H);
     if (y >= H - NStat()) {
         g_chipScroll -= delta * px(60) / WHEEL_DELTA;
         g_chipScroll = std::max(0, std::min(g_chipScroll, std::max(0, g_chipTotalW - (W - px(12)))));
-        InvalidateRect(g_hwnd, nullptr, FALSE);
+        InvalidateRect(g_nw, nullptr, FALSE);
     } else if (g_noteView != 0 && InRect(PreviewArea(W, H), x, y)) {
         g_pvScroll -= delta * px(60) / WHEEL_DELTA;
         ClampPv();
-        InvalidateRect(g_hwnd, nullptr, FALSE);
+        InvalidateRect(g_nw, nullptr, FALSE);
     }
 }
 
@@ -1053,7 +1073,7 @@ static RECT WebMarkRect(int i, int W) {
 }
 static int WebMarkAt(int x, int y) {
     if (g_webPage) return -1;
-    int W, H; ClientWH(W, H);
+    int W, H; ClientWHw(g_ww, W, H);
     for (int i = 0; i < (int)g_webMarks.size() && i < 8; i++) { RECT r = WebMarkRect(i, W); if (InRect(r, x, y)) return i; }
     return -1;
 }
@@ -1155,14 +1175,14 @@ static void WebResize(int W, int H) {
     g_wvCtl->put_Bounds(r);
 }
 static void WebStartNavigation() {
-    if (!g_webReady || !g_webMode) return;
+    if (!g_webReady || !g_webOpen) return;
     wstring u = g_webPending;
     g_webPending.clear();
     if (!u.empty()) { WebNavigate(u); if (g_wvCtl) g_wvCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC); }
-    else { SetFocus(g_hQuery); SendMessageW(g_hQuery, EM_SETSEL, 0, -1); }
+    else { SetFocus(g_hAddr); SendMessageW(g_hAddr, EM_SETSEL, 0, -1); }
 }
 static void WebGo() {
-    wstring t = GetEditText(g_hQuery);
+    wstring t = GetEditText(g_hAddr);
     g_addrDirty = false;
     WebNavigate(t);
     if (g_wvCtl && g_webReady) g_wvCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
@@ -1174,23 +1194,23 @@ static void WebHome() {
     if (g_wv) g_wv->Navigate(L"about:blank");
     if (g_wvCtl) g_wvCtl->put_IsVisible(FALSE);
     g_webPage = false; g_webLoading = 0; g_webSecure = false;
-    KillTimer(g_hwnd, T_PROG);
-    g_suppress = true; SetWindowTextW(g_hQuery, L""); g_suppress = false;
-    SetFocus(g_hQuery);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    KillTimer(g_ww, T_PROG);
+    g_suppress = true; SetWindowTextW(g_hAddr, L""); g_suppress = false;
+    SetFocus(g_hAddr);
+    InvalidateRect(g_ww, nullptr, FALSE);
 }
 
 static void WebFinishSetup() {
     g_webReady = true;
     g_webCreating = false;
-    if (g_webMode) WebStartNavigation();
+    if (g_webOpen) WebStartNavigation();
 }
 
 static void WebSetup() {
     if (!g_wvCtl) return;
     g_wvCtl->get_CoreWebView2(&g_wv);
     if (!g_wv) { g_webCreating = false; return; }
-    { int W, H; ClientWH(W, H); WebResize(W, H); }
+    { int W, H; ClientWHw(g_ww, W, H); WebResize(W, H); }
     g_wvCtl->put_IsVisible(FALSE);   // our own start page shows until the first navigation
     {   // match the theme so there is no white flash
         ComPtr<ICoreWebView2Controller2> c2;
@@ -1233,21 +1253,21 @@ static void WebSetup() {
             if (!UriAllowed(u.c_str())) { a->put_Cancel(TRUE); return S_OK; }   // only http / https
             if (g_webHttpsOnly && _wcsnicmp(u.c_str(), L"http://", 7) == 0 && !IsLocalHost(HostOf(u.c_str()))) {
                 a->put_Cancel(TRUE);   // upgrade to https instead of loading plain http
-                PostMessageW(g_hwnd, WM_WEB_NAVURL_, 0, (LPARAM)new wstring(L"https://" + u.substr(7)));
+                PostMessageW(g_ww, WM_WEB_NAVURL_, 0, (LPARAM)new wstring(L"https://" + u.substr(7)));
                 return S_OK;
             }
             if (_wcsnicmp(u.c_str(), L"about:blank", 11) != 0) {
                 g_webPage = true;
-                if (g_wvCtl && g_webMode) g_wvCtl->put_IsVisible(TRUE);
+                if (g_wvCtl && g_webOpen) g_wvCtl->put_IsVisible(TRUE);
                 g_webLoading = 1; g_progT = 0;
-                SetTimer(g_hwnd, T_PROG, 16, nullptr);
-                InvalidateRect(g_hwnd, nullptr, FALSE);
+                SetTimer(g_ww, T_PROG, 16, nullptr);
+                InvalidateRect(g_ww, nullptr, FALSE);
             }
             return S_OK;
         }).Get(), &tk);
     g_wv->add_NavigationCompleted(Callback<ICoreWebView2NavigationCompletedEventHandler>(
         [](ICoreWebView2*, ICoreWebView2NavigationCompletedEventArgs*) -> HRESULT {
-            g_webLoading = 0; KillTimer(g_hwnd, T_PROG); InvalidateRect(g_hwnd, nullptr, FALSE); return S_OK;
+            g_webLoading = 0; KillTimer(g_ww, T_PROG); InvalidateRect(g_ww, nullptr, FALSE); return S_OK;
         }).Get(), &tk);
     g_wv->add_SourceChanged(Callback<ICoreWebView2SourceChangedEventHandler>(
         [](ICoreWebView2*, ICoreWebView2SourceChangedEventArgs*) -> HRESULT {
@@ -1255,11 +1275,11 @@ static void WebSetup() {
             if (g_wv && SUCCEEDED(g_wv->get_Source(&src)) && src) {
                 bool blank = _wcsnicmp(src, L"about:blank", 11) == 0;
                 g_webSecure = _wcsnicmp(src, L"https://", 8) == 0;
-                if (!blank && !(g_addrDirty && GetFocus() == g_hQuery)) {
-                    g_suppress = true; SetWindowTextW(g_hQuery, src); g_suppress = false; g_addrDirty = false;
+                if (!blank && !(g_addrDirty && GetFocus() == g_hAddr)) {
+                    g_suppress = true; SetWindowTextW(g_hAddr, src); g_suppress = false; g_addrDirty = false;
                 }
                 CoTaskMemFree(src);
-                InvalidateRect(g_hwnd, nullptr, FALSE);
+                InvalidateRect(g_ww, nullptr, FALSE);
             }
             return S_OK;
         }).Get(), &tk);
@@ -1320,12 +1340,11 @@ static void WebSetup() {
             if (kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN || kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN) {
                 bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0;
                 UINT cmd = 0;
-                if (vk == VK_ESCAPE || (ctrl && vk == 'W')) cmd = WM_NOTE_CLOSE;
-                else if (ctrl && vk == 'L') cmd = WM_WEB_FOCUSADDR;
+                if (ctrl && vk == 'L') cmd = WM_WEB_FOCUSADDR;
                 else if (alt && vk == VK_LEFT) cmd = WM_WEB_BACK;
                 else if (alt && vk == VK_RIGHT) cmd = WM_WEB_FWD;
                 else if (vk == VK_F5 || (ctrl && vk == 'R')) cmd = WM_WEB_RELOAD;
-                if (cmd) { PostMessageW(g_hwnd, cmd, 0, 0); a->put_Handled(TRUE); }
+                if (cmd) { PostMessageW(g_ww, cmd, 0, 0); a->put_Handled(TRUE); }
             }
             return S_OK;
         }).Get(), &tk);
@@ -1347,10 +1366,22 @@ static void WebSetup() {
     WebFinishSetup();
 }
 
+static void WebCreateController() {
+    if (!g_wvEnv || !g_ww) { g_webCreating = false; return; }
+    g_wvEnv->CreateCoreWebView2Controller(g_ww, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+        [](HRESULT r2, ICoreWebView2Controller* ctl) -> HRESULT {
+            if (!g_webOpen || !g_ww) { g_webCreating = false; if (ctl) ctl->Close(); return S_OK; }   // window closed meanwhile
+            if (FAILED(r2) || !ctl) { g_webCreating = false; Balloon(L"Quick Palette", L"The browser could not start.", NIIF_WARNING); return S_OK; }
+            g_wvCtl = ctl;
+            WebSetup();
+            return S_OK;
+        }).Get());
+}
 static void WebCreate() {
     if (g_wvCtl && g_webReady) { WebStartNavigation(); return; }
-    if (g_webCreating || g_wvCtl) return;   // already on its way
+    if (g_webCreating) return;   // engine or controller already on its way
     g_webCreating = true;
+    if (g_wvEnv) { if (g_webOpen) WebCreateController(); else g_webCreating = false; return; }
     wstring udf = g_dir + L"\\web";
     CreateDirectoryW(udf.c_str(), nullptr);
     auto opts = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
@@ -1362,27 +1393,21 @@ static void WebCreate() {
     HRESULT hr = CreateCoreWebView2EnvironmentWithOptions(nullptr, udf.c_str(), opts.Get(),
         Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
             [](HRESULT r, ICoreWebView2Environment* env) -> HRESULT {
-                if (FAILED(r) || !env || !(g_webMode || g_webWarm)) { g_webCreating = false; return S_OK; }
+                if (FAILED(r) || !env) { g_webCreating = false; return S_OK; }
                 g_wvEnv = env;
-                return env->CreateCoreWebView2Controller(g_hwnd, Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                    [](HRESULT r2, ICoreWebView2Controller* ctl) -> HRESULT {
-                        if (!(g_webMode || g_webWarm)) { g_webCreating = false; if (ctl) ctl->Close(); return S_OK; }
-                        if (FAILED(r2) || !ctl) { g_webCreating = false; Balloon(L"Quick Palette", L"The browser could not start.", NIIF_WARNING); return S_OK; }
-                        g_wvCtl = ctl;
-                        WebSetup();
-                        return S_OK;
-                    }).Get());
+                if (g_webOpen && g_ww) WebCreateController(); else g_webCreating = false;   // warm-up only: no window yet
+                return S_OK;
             }).Get());
     if (FAILED(hr)) {
         g_webCreating = false;
-        Balloon(L"Quick Palette", L"The Microsoft Edge WebView2 Runtime was not found. Install it to use the built-in browser.", NIIF_WARNING);
+        if (g_webOpen) Balloon(L"Quick Palette", L"The Microsoft Edge WebView2 Runtime was not found. Install it to use the built-in browser.", NIIF_WARNING);
     }
 }
-static void WebPrewarm() {   // start the engine while the user is still typing "w"
-    if (!g_webPrewarm || g_wvCtl || g_webCreating || g_webMode) return;
+static void WebPrewarm() {   // start the engine while the user is still typing "w" (no window, no page)
+    if (!g_webPrewarm || g_wvEnv || g_webCreating || g_webOpen) return;
     g_webWarm = true;
     WebCreate();
-    SetTimer(g_hwnd, T_WEBFREE, 10000, nullptr);   // not used? drop it again
+    SetTimer(g_hwnd, T_WEBFREE, 10000, nullptr);   // not used? let it go again
 }
 static void WebTeardown() {
     g_webReady = false; g_webCreating = false; g_webWarm = false;
@@ -1405,43 +1430,84 @@ static void WebTeardown() {}
 
 static void WebOpenMark(int i) {
     if (i < 0 || i >= (int)g_webMarks.size()) return;
-    g_suppress = true; SetWindowTextW(g_hQuery, g_webMarks[i].url.c_str()); g_suppress = false;
+    g_suppress = true; SetWindowTextW(g_hAddr, g_webMarks[i].url.c_str()); g_suppress = false;
     WebNavigate(g_webMarks[i].url);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    InvalidateRect(g_ww, nullptr, FALSE);
+}
+
+static LRESULT CALLBACK AddrProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_KEYDOWN: {
+            bool ctrl = GetKeyState(VK_CONTROL) < 0;
+            if (w == VK_RETURN) { PostMessageW(g_ww, WM_WEB_GO, 0, 0); return 0; }
+            if (ctrl && w == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
+            if (w == VK_F5) { PostMessageW(g_ww, WM_WEB_RELOAD, 0, 0); return 0; }
+            break;
+        }
+        case WM_SYSKEYDOWN:
+            if (w == VK_LEFT) { PostMessageW(g_ww, WM_WEB_BACK, 0, 0); return 0; }
+            if (w == VK_RIGHT) { PostMessageW(g_ww, WM_WEB_FWD, 0, 0); return 0; }
+            if (!g_webPage && w >= '1' && w <= '9') { PostMessageW(g_ww, WM_WEB_MARK, (WPARAM)(w - '1'), 0); return 0; }
+            break;
+        case WM_CHAR:
+            if (w == 13 || w == 27) return 0;
+            if (GetKeyState(VK_CONTROL) < 0 && w == 1) return 0;
+            break;
+        case WM_SYSCHAR: if (w >= '1' && w <= '9') return 0; break;
+    }
+    return CallWindowProcW(g_oldAddr, h, m, w, l);
+}
+
+static void WebLayout() {
+    if (!g_webOpen || !g_ww) return;
+    int W, H; ClientWHw(g_ww, W, H);
+    if (g_hAddr) MoveWindow(g_hAddr, WebEditX(), (WebHdr() - g_addrH) / 2, std::max(60, W - WebEditX() - px(24)), g_addrH, TRUE);
+    WebResize(W, H);
+    InvalidateRect(g_ww, nullptr, FALSE);
 }
 
 static void EnterWeb(const wstring& url) {
-    g_webMode = true; g_webWarm = false; g_noteMode = false; g_addrDirty = false;
     KillTimer(g_hwnd, T_WEBFREE); KillTimer(g_hwnd, T_WIPE);
-    g_results.clear(); g_rows.clear();
-    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);   // a layered window can show a blank web page, so drop it while browsing
-    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~(LONG_PTR)WS_EX_LAYERED);
-    g_suppress = true; SetWindowTextW(g_hQuery, url.c_str()); g_suppress = false;
-    g_query.clear(); g_qLines = 1; g_webHover = -1; g_btnHover = -1;
-    g_lastSig = -1;
-    ApplyLayout();
-    SetFocus(g_hQuery);
-    SendMessageW(g_hQuery, EM_SETSEL, 0, -1);
+    g_webWarm = false;
+    if (g_webOpen && g_ww) {   // already open: bring it forward
+        if (IsIconic(g_ww)) ShowWindow(g_ww, SW_RESTORE);
+        SetForegroundWindow(g_ww);
+        if (!url.empty()) { g_suppress = true; SetWindowTextW(g_hAddr, url.c_str()); g_suppress = false; WebNavigate(url); }
+        else { SetFocus(g_hAddr); SendMessageW(g_hAddr, EM_SETSEL, 0, -1); }
+        return;
+    }
+    g_ww = MakeToolWindow(L"Browser \u2014 Quick Palette", g_webW, g_webH);
+    if (!g_ww) return;
+    g_webOpen = true; g_addrDirty = false; g_webLoading = 0; g_webPage = false; g_webHover = -1; g_btnHover = -1;
+    g_suppress = true;
+    g_hAddr = CreateWindowExW(0, L"EDIT", url.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT,
+                              0, 0, 100, g_addrH, g_ww, (HMENU)(INT_PTR)103, g_inst, nullptr);
+    g_suppress = false;
+    SendMessageW(g_hAddr, WM_SETFONT, (WPARAM)g_fTitle, TRUE);
+    SendMessageW(g_hAddr, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
+    SendMessageW(g_hAddr, EM_LIMITTEXT, 2000, 0);
+    g_oldAddr = (WNDPROC)SetWindowLongPtrW(g_hAddr, GWLP_WNDPROC, (LONG_PTR)AddrProc);
+    WebLayout();
+    ShowWindow(g_ww, SW_SHOW);
+    SetForegroundWindow(g_ww);
+    SetFocus(g_hAddr);
+    SendMessageW(g_hAddr, EM_SETSEL, 0, -1);
 #ifdef QP_WEBVIEW
     g_webPending = url;
-    if (g_wvCtl && g_webReady) { if (g_webPage) { /* still showing a page from before: start fresh */ g_wv->Navigate(L"about:blank"); g_wvCtl->put_IsVisible(FALSE); g_webPage = false; } WebStartNavigation(); }
-    else WebCreate();
-#else
+#endif
     WebCreate();
-#endif
 }
-static void ExitWeb() {
-    g_webMode = false;
-    g_webLoading = 0; g_addrDirty = false; g_webPage = false;
-    KillTimer(g_hwnd, T_PROG);
+static void ExitWeb() {   // the browser window was destroyed
+    KillTimer(g_ww, T_PROG);
 #ifdef QP_WEBVIEW
-    if (g_wv) g_wv->Navigate(L"about:blank");        // frees the page's memory right away
-    if (g_wvCtl) g_wvCtl->put_IsVisible(FALSE);
+    if (g_wvCtl) { g_wvCtl->Close(); g_wvCtl.Reset(); }
+    g_wv.Reset();
+    g_webReady = false; g_webCreating = false; g_webPending.clear();
 #endif
-    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-    SetLayeredWindowAttributes(g_hwnd, 0, 255, LWA_ALPHA);
-    SetTimer(g_hwnd, T_WEBFREE, (UINT)std::max(1, g_webKeepAlive) * 1000, nullptr);   // stay warm a little, then exit completely
+    g_webOpen = false; g_webLoading = 0; g_addrDirty = false; g_webPage = false;
+    g_hAddr = nullptr; g_oldAddr = nullptr; g_ww = nullptr;
+    // keep the engine warm briefly so the next open is instant, then it exits completely and frees its RAM
+    SetTimer(g_hwnd, T_WEBFREE, (UINT)std::max(1, g_webKeepAlive) * 1000, nullptr);
 }
 
 static void DrawWeb(HDC dc, int W, int H) {
@@ -1493,7 +1559,7 @@ static void DrawWeb(HDC dc, int W, int H) {
 
     // start page: drawn by us, so it appears instantly
     TextAt(dc, g_fNoteHead, T.text, L"Where to?", { 0, WebHdr() + px(40), W, WebHdr() + px(78) }, DT_CENTER | DT_VCENTER);
-    TextAt(dc, g_fSub, T.dim, L"Type an address or search words above and press Enter.   Ads and trackers are blocked.   Esc closes.",
+    TextAt(dc, g_fSub, T.dim, L"Type an address or search words above and press Enter.   Ads and trackers are blocked.",
            { px(20), WebHdr() + px(80), W - px(20), WebHdr() + px(104) }, DT_CENTER | DT_VCENTER);
     static const COLORREF pal[8] = { RGB(59,130,246), RGB(239,68,68), RGB(245,158,11), RGB(20,184,166), RGB(168,85,247), RGB(236,72,153), RGB(34,197,94), RGB(100,116,139) };
     for (int i = 0; i < (int)g_webMarks.size() && i < 8; i++) {
@@ -1521,7 +1587,193 @@ static void WebMouseMove(int x, int y) {
     int m = WebMarkAt(x, y), b = -1;
     RECT br[4]; WebBtnRects(br);
     for (int i = 0; i < 4; i++) if (InRect(br[i], x, y)) b = i;
-    if (m != g_webHover || b != g_btnHover) { g_webHover = m; g_btnHover = b; InvalidateRect(g_hwnd, nullptr, FALSE); }
+    if (m != g_webHover || b != g_btnHover) { g_webHover = m; g_btnHover = b; InvalidateRect(g_ww, nullptr, FALSE); }
+}
+
+// ================================================================== standalone windows (notes + browser)
+// Normal top-level windows: own title bar with minimize / maximize / close, resizable, not always-on-top,
+// they do not close when they lose focus, and the palette can be opened over them at any time.
+static const wchar_t* kToolClass = L"QuickPaletteTool";
+
+static void EnsureDpiFor(HWND h) {
+    int d = (int)GetDpiForWindow(h);
+    if (d > 0 && d != g_dpi) SetDpi(d, true);
+}
+static void StyleToolWindow(HWND h) {
+    int dk = g_th->dark ? 1 : 0;
+    DwmSetWindowAttribute(h, 20, &dk, sizeof dk);   // dark title bar
+    if (g_win11) {
+        COLORREF cap = g_th->footerBg, txt = g_th->text, brd = g_th->border;
+        DwmSetWindowAttribute(h, 35, &cap, sizeof cap);   // title bar color
+        DwmSetWindowAttribute(h, 36, &txt, sizeof txt);   // title text color
+        DwmSetWindowAttribute(h, 34, &brd, sizeof brd);   // border color
+    }
+}
+static HWND MakeToolWindow(const wchar_t* title, int w96, int h96) {
+    POINT pt; GetCursorPos(&pt);
+    HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) };
+    GetMonitorInfoW(mon, &mi);
+    UINT dx = 96, dy = 96;
+    GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
+    if ((int)dx != g_dpi) SetDpi((int)dx, true);
+    ApplyTheme();
+    int ww = (int)(mi.rcWork.right - mi.rcWork.left), wh = (int)(mi.rcWork.bottom - mi.rcWork.top);
+    int w = std::min(px(w96), ww - px(40)), h = std::min(px(h96), wh - px(40));
+    int x = (int)mi.rcWork.left + (ww - w) / 2, y = (int)mi.rcWork.top + (wh - h) / 2;
+    HWND hw = CreateWindowExW(0, kToolClass, title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_CLIPSIBLINGS, x, y, w, h, nullptr, nullptr, g_inst, nullptr);
+    if (hw) StyleToolWindow(hw);
+    return hw;
+}
+
+static LRESULT CALLBACK ToolProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    bool isNote = (h == g_nw), isWeb = (h == g_ww);
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_GETMINMAXINFO: {
+            auto* mm = (MINMAXINFO*)lp;
+            mm->ptMinTrackSize.x = px(520); mm->ptMinTrackSize.y = px(340);
+            return 0;
+        }
+        case WM_SIZE:
+            if (wp != SIZE_MINIMIZED) { EnsureDpiFor(h); if (isNote) NoteLayout(); else if (isWeb) WebLayout(); }
+            return 0;
+        case WM_DPICHANGED: {
+            const RECT* r = (const RECT*)lp;
+            SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetDpi((int)LOWORD(wp), true);
+            if (isNote && g_hEditor) {
+                HFONT nf = MakeFont(px(g_noteFontSize), 400, g_noteFont.c_str());
+                SendMessageW(g_hEditor, WM_SETFONT, (WPARAM)nf, TRUE);
+                if (g_fNote) DeleteObject(g_fNote);
+                g_fNote = nf;
+            }
+            if (isNote) NoteLayout(); else if (isWeb) WebLayout();
+            return 0;
+        }
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(h, &ps);
+            RECT rc; GetClientRect(h, &rc);
+            HDC m = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            HGDIOBJ old = SelectObject(m, bmp);
+            if (isWeb) DrawWeb(m, rc.right, rc.bottom); else if (isNote) DrawNote(m, rc.right, rc.bottom);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, m, 0, 0, SRCCOPY);
+            SelectObject(m, old); DeleteObject(bmp); DeleteDC(m);
+            EndPaint(h, &ps);
+            return 0;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wp) != WA_INACTIVE) {
+                if (isNote && g_hEditor && g_noteView != 2) SetFocus(g_hEditor);
+                else if (isWeb && g_hAddr && !g_webPage) SetFocus(g_hAddr);
+#ifdef QP_WEBVIEW
+                else if (isWeb && g_wvCtl && g_webPage) g_wvCtl->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+#endif
+            }
+            return 0;
+        case WM_COMMAND:
+            if (HIWORD(wp) == EN_CHANGE) {
+                if (LOWORD(wp) == 102) OnNoteChanged();
+                else if (LOWORD(wp) == 103 && !g_suppress) g_addrDirty = true;
+            }
+            return 0;
+        case WM_CTLCOLOREDIT: {
+            HDC dc = (HDC)wp;
+            if ((HWND)lp == g_hEditor) { SetTextColor(dc, g_th->editorText); SetBkColor(dc, g_th->editorBg); return (LRESULT)g_brEd; }
+            SetTextColor(dc, g_th->text); SetBkColor(dc, g_th->chip);
+            return (LRESULT)g_brChip;   // address bar
+        }
+        case WM_TIMER:
+            if (isNote) {
+                if (wp == T_AUTOSAVE) SaveNote();
+                else if (wp == T_PREVIEW) { KillTimer(h, T_PREVIEW); RebuildPreview(true); }
+            } else if (isWeb && wp == T_PROG) {
+                g_progT++;
+                RECT hb = { 0, 0, 8000, WebHdr() + 3 };
+                InvalidateRect(h, &hb, FALSE);
+            }
+            return 0;
+        case WM_MOUSEMOVE: {
+            int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+            TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, h, 0 };
+            TrackMouseEvent(&t);
+            if (isNote) NoteMouseMove(x, y); else if (isWeb) WebMouseMove(x, y);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (isNote && g_chipHot != -1) { g_chipHot = -1; InvalidateRect(h, nullptr, FALSE); }
+            if (isWeb && (g_webHover != -1 || g_btnHover != -1)) { g_webHover = -1; g_btnHover = -1; InvalidateRect(h, nullptr, FALSE); }
+            return 0;
+        case WM_LBUTTONDOWN:
+            if (isNote) NoteMouseDown(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+        case WM_LBUTTONUP:
+            if (isNote) NoteMouseUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            else if (isWeb) WebMouseUp(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (isNote) {
+                POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+                ScreenToClient(h, &p);
+                NoteWheel(GET_WHEEL_DELTA_WPARAM(wp), p.x, p.y);
+            }
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lp) == HTCLIENT) {
+                POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
+                bool hand = false;
+                if (isWeb) hand = WebHandAt(p.x, p.y);
+                else if (isNote) {
+                    int lx, ly, W, H; RECT bt[3];
+                    if (PvPoint(p.x, p.y, lx, ly)) hand = g_md.HitLink(lx, ly) >= 0 || g_md.HitTask(lx, ly) >= 0;
+                    if (!hand && ChipAt(p.x, p.y) >= 0) hand = true;
+                    ClientWHw(h, W, H); BtnRects(W, bt);
+                    for (int i = 0; i < 3; i++) if (InRect(bt[i], p.x, p.y)) hand = true;
+                }
+                SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+                return TRUE;
+            }
+            break;
+        case WM_KEYDOWN:   // only when the window itself (not a text box) has focus, e.g. preview-only note view
+            if (isNote) {
+                bool ctrl = GetKeyState(VK_CONTROL) < 0;
+                int W, H; ClientWHw(h, W, H);
+                RECT pa = PreviewArea(W, H);
+                int vh = pa.bottom - pa.top;
+                switch (wp) {
+                    case VK_DOWN: g_pvScroll += px(40); break;
+                    case VK_UP: g_pvScroll -= px(40); break;
+                    case VK_NEXT: g_pvScroll += vh * 9 / 10; break;
+                    case VK_PRIOR: g_pvScroll -= vh * 9 / 10; break;
+                    case VK_HOME: g_pvScroll = 0; break;
+                    case VK_END: g_pvScroll = g_pvH; break;
+                    case 'P': if (ctrl) { CycleView(); return 0; } break;
+                    case 'S': if (ctrl) { SaveNote(); return 0; } break;
+                    default: return 0;
+                }
+                ClampPv();
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            break;
+        case WM_WEB_GO: WebGo(); return 0;
+        case WM_WEB_BACK: WebBack(); return 0;
+        case WM_WEB_FWD: WebFwd(); return 0;
+        case WM_WEB_RELOAD: WebReload(); return 0;
+        case WM_WEB_FOCUSADDR: if (g_hAddr) { SetFocus(g_hAddr); SendMessageW(g_hAddr, EM_SETSEL, 0, -1); } return 0;
+        case WM_WEB_NAVURL: { auto* u = (wstring*)lp; if (u) { WebNavigate(*u); delete u; } return 0; }
+        case WM_WEB_MARK: WebOpenMark((int)wp); return 0;
+        case WM_CLOSE:
+            if (isNote) SaveNote();
+            DestroyWindow(h);
+            return 0;
+        case WM_DESTROY:
+            if (isNote) ExitNote(); else if (isWeb) ExitWeb();
+            return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
 }
 
 // ================================================================== show / hide / tray / window
@@ -1568,8 +1820,6 @@ static void ShowPalette() {
 
 static void HidePalette() {
     if (!IsWindowVisible(g_hwnd)) return;
-    if (g_webMode) ExitWeb();
-    if (g_noteMode) { SaveNote(); ExitNote(); }
     ShowWindow(g_hwnd, SW_HIDE);
     SetTimer(g_hwnd, T_TRIM, 800, nullptr);
     SetTimer(g_hwnd, T_FREE, 180000, nullptr);   // drop the file index from RAM after 3 idle minutes
@@ -1686,17 +1936,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(h, nullptr, FALSE);
             } else if (wp == T_PREWARM) {
                 KillTimer(h, T_PREWARM);
-                if (!g_webMode && !g_noteMode && !g_webTrigger.empty() && lower(Trim(GetEditText(g_hQuery))) == lower(g_webTrigger)) WebPrewarm();
+                if (!g_webOpen && !g_webTrigger.empty() && lower(Trim(GetEditText(g_hQuery))) == lower(g_webTrigger)) WebPrewarm();
             } else if (wp == T_PROG) {
                 g_progT++;
                 RECT hb = { 0, 0, 4000, WebHdr() + 3 };
                 InvalidateRect(h, &hb, FALSE);
             } else if (wp == T_WEBFREE) {
                 KillTimer(h, T_WEBFREE);
-                if (!g_webMode) { WebTeardown(); if (g_webPrivate) SetTimer(h, T_WIPE, 4000, nullptr); }
+                if (!g_webOpen) { WebTeardown(); if (g_webPrivate) SetTimer(h, T_WIPE, 4000, nullptr); }
             } else if (wp == T_WIPE) {
                 KillTimer(h, T_WIPE);
-                if (!g_webMode && g_webPrivate) WipeDir(g_dir + L"\\web");
+                if (!g_webOpen && g_webPrivate) WipeDir(g_dir + L"\\web");
             } else if (wp == T_QUERY) {
                 KillTimer(h, T_QUERY);
                 if (!g_noteMode) Refresh();
@@ -1841,6 +2091,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_DESTROY:
             SaveNote();
+            if (g_ww) DestroyWindow(g_ww);
+            if (g_nw) DestroyWindow(g_nw);
             Shell_NotifyIconW(NIM_DELETE, &g_nid);
             UnregisterHotKey(h, 1);
             PostQuitMessage(0);
@@ -1900,6 +2152,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_DEFAULTCOLOR);
     wc.lpszClassName = kClass;
     RegisterClassExW(&wc);
+
+    WNDCLASSEXW tc = { sizeof tc };   // class for the standalone note / browser windows
+    tc.style = CS_HREDRAW | CS_VREDRAW;
+    tc.lpfnWndProc = ToolProc;
+    tc.hInstance = inst;
+    tc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    tc.hIcon = wc.hIcon; tc.hIconSm = wc.hIconSm;
+    tc.lpszClassName = kToolClass;
+    RegisterClassExW(&tc);
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kClass, L"Quick Palette", WS_POPUP | WS_CLIPCHILDREN, 0, 0, px(640), px(60), nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;

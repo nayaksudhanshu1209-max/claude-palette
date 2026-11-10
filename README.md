@@ -37,9 +37,15 @@ calculator, unit conversion, and a Markdown note editor with live preview.
 | Ctrl+D | pin / unpin the selected item (pinned items show first when the box is empty) |
 | Ctrl+Shift+C | copy the path of a file result |
 
+## Notes and the browser are real windows
+- `n ` (notes) and `w ` (browser) open their own normal windows: minimize / maximize / close buttons, resizable,
+  not always-on-top, and they stay open when you click elsewhere. Esc does not close them.
+- The palette stays the only always-on-top popup: press the hotkey any time, even with a note or the browser open.
+- Notes save automatically (and when you close the window). Closing the browser window frees its memory.
+
 ## Built-in browser (`w `)
 - Type `w` and a space: a start page appears instantly (tiles for your favorite sites, Alt+1..8 opens one) and the search box
-  becomes an address bar. Type a site or search words (Google by default), press Enter. Esc closes it.
+  becomes an address bar. Type a site or search words (Google by default), press Enter. Close it with the window's X button.
 - The engine warms up while you pause on `w`, and stays warm for 45 s after closing so reopening is instant, then exits completely.
 - Needs the Microsoft Edge WebView2 Runtime (already on most Windows 10/11 PCs).
 - It exists only while open: closing it ends every browser process and (by default) wipes cookies, cache and history.
@@ -50,11 +56,11 @@ calculator, unit conversion, and a Markdown note editor with live preview.
   at the cost of isolation and speed.
 - Extensions (such as uBlock Origin Lite): unzip the extension and add `web_extension=C:\path\to\folder` to config.ini.
   WebView2 only supports part of the extension system, so this is best-effort.
-- Keys: Enter go, Alt+Left/Right back/forward, F5 reload, Ctrl+L address bar, Esc close. Command "Clear browser data".
+- Keys: Enter go, Alt+Left/Right back/forward, F5 reload, Ctrl+L address bar, Command "Clear browser data".
 
 ## Notes (Markdown editor)
 - Type your note trigger and a space (default `n `). The search box becomes a large editor with live preview.
-- View buttons: Edit / Split / Preview (Ctrl+P cycles). Esc saves and closes. Ctrl+S saves. Autosaves every few seconds.
+- View buttons: Edit / Split / Preview (Ctrl+P cycles). Ctrl+S saves; it also autosaves every few seconds and when you close the window.
 - Status bar: click a syntax chip to insert it at the cursor (wraps your selection). Chips are ordered by how often
   YOU use them, separately for each note file.
 - Ctrl+B bold, Ctrl+I italic, Ctrl+K link. Enter continues lists and quotes. Task boxes in the preview are clickable.
