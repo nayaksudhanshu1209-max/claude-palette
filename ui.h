@@ -183,6 +183,7 @@ static HDC GetBackBuffer(HDC ref, int w, int h) {   // one reusable off-screen b
 }
 
 static int WebHdr() { return px(52); }
+static int WebEditX() { return px(150) + px(40); }   // left edge of the address text
 static int WebW() { return std::max(px(520), std::min(px(g_webW), (int)(g_work.right - g_work.left) - px(24))); }
 static int WebH() { return std::max(px(360), std::min(px(g_webH), (int)(g_work.bottom - g_work.top) - px(24))); }
 
