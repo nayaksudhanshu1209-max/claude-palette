@@ -1,70 +1,59 @@
 # Quick Palette
 
-A tiny offline launcher for Windows 10/11: apps, settings, files in your own folders, commands, bangs,
-calculator, unit conversion, and a Markdown note editor with live preview.
+A small, offline-first launcher for Windows 10/11: apps, Windows settings, files in your own folders, commands, bangs,
+a calculator, timers, a live-formatting Markdown note window and an optional built-in browser.
 
 ## What it does and does not do
 - **The app itself has no network code.** Web "bangs" hand a URL to your default browser. The optional built-in browser
   (`w `) uses Microsoft's Edge WebView2 Runtime, and that runtime does the networking, not this program.
-- **No telemetry, accounts, updates or downloads.**
-- **No keyboard hooks, no clipboard watching, no screen capture, no injection into other processes.**
-  The only global key is one registered hotkey (default Ctrl+Space).
-- **Files it touches:** `%AppData%\QuickPalette\` (config.ini, usage.txt, hidden.txt, apps.txt, files.txt, note_usage.txt)
-  and the note files YOU configure.
-- **Registry:** one value (`HKCU\...\Run\QuickPalette`) ONLY if you answer Yes to the first-run question or turn startup on.
-- **File search** indexes file/folder *names* only, only in folders you list, in the background at low priority.
-- Source: `main.cpp` (core), `ui.h` (window + notes), `md.h` (Markdown renderer).
+- No telemetry, accounts, updates or downloads. No keyboard hooks, no clipboard watching, no screen capture.
+- Files it touches: `%AppData%\QuickPalette\` and the note files YOU configure.
+- Registry: one value (`HKCU\...\Run\QuickPalette`) ONLY if you answer Yes to the first-run question or turn startup on.
+- File search reads file/folder NAMES only, only in the folders you list, in the background at low priority.
+- Source: `main.cpp` (core), `ui.h` (palette), `note.h` (notes), `web.h` (browser).
 
-## Keys
+## Palette
 | | |
 |---|---|
-| Ctrl+Space | open / close (change in config.ini) |
-| Up / Down / Tab / PgUp / PgDn | move through results (mouse works too) |
-| Enter / click | run |
+| Ctrl+Space | open / close (change `hotkey=`) |
+| Up / Down / Tab / Shift+Tab / PgUp / PgDn | move through results (mouse works too) |
+| Enter | run |
 | Ctrl+Enter | show a file in its folder |
-| Ctrl+H or right-click | hide an item (Unhide: type "unhide") |
-| Esc, click outside, run something | closes the palette (saves an open note first) |
-| `f report` | file search |
-| `g cats`, `yt lofi` ... | web bangs |
-| `n ` (n + space) | note editor |
-| `10 km to mi`, `2*(3+4)`, `sqrt(16)`, `255 to hex`, `date`, `guid`, `> notepad file.txt` | quick answers / run box |
-| `#ff8800` or `rgb(255,136,0)` | color converter (HEX / RGB / HSL) |
-| `upper`/`lower`/`title`/`len`/`b64`/`b64d`/`urlenc`/`urldec` + text | text tools |
-| `timer 10m`, `remind 1h30m call mom`, `timer off` | timers and reminders (notification when done) |
-| `sw chrome` | switch to an open window |
-| `n+ buy milk` | quick capture: appends a line to your note without opening it |
-| Alt+1 ... Alt+9 | run the numbered result |
-| Ctrl+D | pin / unpin the selected item (pinned items show first when the box is empty) |
-| Ctrl+Shift+C | copy the path of a file result |
+| Ctrl+Shift+C | copy a file's path |
+| Ctrl+D | pin / unpin (pinned items show first when the box is empty) |
+| Ctrl+H or right-click | hide an item (type "unhide" to bring all back) |
+| Esc, click outside, run something | closes the palette |
 
-## Notes and the browser are real windows
-- `n ` (notes) and `w ` (browser) open their own normal windows: minimize / maximize / close buttons, resizable,
-  not always-on-top, and they stay open when you click elsewhere. Esc does not close them.
-- The palette stays the only always-on-top popup: press the hotkey any time, even with a note or the browser open.
-- Notes save automatically (and when you close the window). Closing the browser window frees its memory.
+Type: `f report` (file search) · `g cats` / `yt lofi` (web bangs) · `n ` (notes) · `w ` (browser) ·
+`2*(3+4)`, `sqrt(16)` · `date` `time` `unix` `guid` · `> notepad file.txt` · `timer 10m`, `remind 1h30m call mom`, `timer off` ·
+`n+ buy milk` (adds a line to your note without opening it).
 
-## Built-in browser (`w `)
-- Type `w` and a space: a start page appears instantly (tiles for your favorite sites, Alt+1..8 opens one) and the search box
-  becomes an address bar. Type a site or search words (Google by default), press Enter. Close it with the window's X button.
-- The engine warms up while you pause on `w`, and stays warm for 45 s after closing so reopening is instant, then exits completely.
-- Needs the Microsoft Edge WebView2 Runtime (already on most Windows 10/11 PCs).
-- It exists only while open: closing it ends every browser process and (by default) wipes cookies, cache and history.
-- Safety: https-only (http upgraded), certificate errors can't be clicked through, only http/https pages, no downloads,
-  camera/mic/location/notification requests denied, no pop-ups, pages can't launch other programs, strict tracking prevention,
-  built-in ad/tracker blocking, SmartScreen on, DevTools and password/autofill saving off.
-- Memory: several `msedgewebview2.exe` processes are normal (browser, GPU, network, one per site). `web_lowram=1` trims them
-  at the cost of isolation and speed.
-- Extensions (such as uBlock Origin Lite): unzip the extension and add `web_extension=C:\path\to\folder` to config.ini.
-  WebView2 only supports part of the extension system, so this is best-effort.
-- Keys: Enter go, Alt+Left/Right back/forward, F5 reload, Ctrl+L address bar, Command "Clear browser data".
+## Notes (`n `)
+- Opens its own window with no title bar: one live Markdown editor. Esc or Ctrl+W saves and closes. Clicking elsewhere does not close it.
+- Formatting appears as you type. The syntax marks (`**`, `~~`, `` ` ``, `[](url)`, `#`) are hidden while the caret is elsewhere
+  and shown dimmed while the caret is inside that piece of text.
+- Auto-complete: typing `*` `_` `~` `=` `` ` `` `[` `(` completes the pair; typing `**` makes bold; typing the closing mark steps over it;
+  Backspace on an empty pair removes both. Enter continues lists and quotes. Click a task box to tick it. Ctrl+click opens a link.
+- Bottom bar: syntax chips (click to insert / wrap your selection), ordered by your use per note file. It scrolls sideways:
+  mouse wheel, drag, the arrow buttons, or a horizontal wheel/touchpad.
+- Move the window by dragging the thin strip above the text (or an empty part of the bottom bar); resize from the edges.
+- Ctrl+S saves; it also autosaves a few seconds after you stop typing and when the window closes.
 
-## Notes (Markdown editor)
-- Type your note trigger and a space (default `n `). The search box becomes a large editor with live preview.
-- View buttons: Edit / Split / Preview (Ctrl+P cycles). Ctrl+S saves; it also autosaves every few seconds and when you close the window.
-- Status bar: click a syntax chip to insert it at the cursor (wraps your selection). Chips are ordered by how often
-  YOU use them, separately for each note file.
-- Ctrl+B bold, Ctrl+I italic, Ctrl+K link. Enter continues lists and quotes. Task boxes in the preview are clickable.
+## Browser (`w `)
+- There is no address bar: the palette is the address bar. Type `w `, then a site or search words (Google by default), press Enter.
+  Empty after `w ` shows your bookmarks (`web_bookmark=Name|URL` lines in config.ini).
+- The browser engine starts in the background the moment you type `w `, so Enter shows the page straight away.
+- The browser window is only the web page: no tabs, no bars, no buttons. Esc or Ctrl+W close it, Alt+Left / Alt+Right back / forward,
+  F5 reload, F11 maximize / restore, Ctrl+L opens the palette with `w ` ready for a new address.
+- With the browser already open, searching from the palette just loads the new page in the same window.
+- Security: private (in-memory) profile, https-only (http upgraded), certificate errors can't be clicked through, only http/https pages,
+  no downloads, camera/mic/location/notification requests denied, no pop-ups, pages can't launch other programs, a public site
+  cannot reach your PC or home network, strict tracking prevention, built-in ad/tracker blocking, SmartScreen on, DevTools and
+  password/autofill off.
+- Memory: it stays warm 45 s after closing (instant reopen), then exits completely. Several `msedgewebview2.exe` processes are normal.
+  `web_lowram=1` trims them at the cost of isolation and speed.
 
 ## Settings
-You can also type things like "theme dark", "compact", "animations" or "cursor" in the palette to switch options without editing the file.
-Tray icon > Edit settings opens `config.ini` (theme, compact, width, at_cursor, show_recent, folders, notes, bangs, ...).
+Tray icon > Edit settings opens `config.ini` (reloaded the next time you open the palette). Useful lines: `folder=` (file search),
+`quick_folders=` (which quick-folder commands exist), `theme`, `compact`, `at_cursor`, `show_recent`, `animations`, `note=`, `web_*`.
+You can also type "theme dark", "compact", "cursor", "animations" or "browser search" in the palette to switch options.
