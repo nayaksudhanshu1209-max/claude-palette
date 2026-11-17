@@ -54,7 +54,7 @@ using std::vector;
 // ------------------------------------------------------------------ types
 enum Cat { C_APP, C_SET, C_CMD, C_CALC, C_OPEN, C_WEB, C_BANG, C_FILE, C_SNIP, C_COUNT };
 enum Kind { K_NONE, K_OPEN, K_APP, K_LOCK, K_RECYCLE, K_QUIT, K_EDITCFG, K_RELOAD, K_UNHIDE, K_EDITHIDDEN, K_COPY, K_CFGDIR,
-            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX, K_NOTE, K_TIMER, K_TIMEROFF, K_NOTEADD, K_CFG, K_BROWSE, K_WEBCLEAR };
+            K_SHUTDOWN, K_RESTART, K_LOGOFF, K_SLEEP, K_STARTUP_ON, K_STARTUP_OFF, K_REINDEX, K_NOTE, K_TIMER, K_TIMEROFF, K_NOTEADD, K_CFG, K_BROWSE, K_WEBCLEAR, K_SETTINGS };
 
 struct Item {
     wstring id, title, sub, tl, kl, group;
@@ -79,7 +79,7 @@ static HWND g_hwnd;
 static const wchar_t* kClass = L"QuickPaletteWnd";
 static const UINT WM_TRAY = WM_APP + 1, WM_APPS_READY = WM_APP + 2, WM_SHOWME = WM_APP + 3, WM_FILES_READY = WM_APP + 4;
 static UINT g_wmTaskbar;
-enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_FMT = 4, T_FREE = 5, T_ANIM = 6, T_SEL = 7, T_QUERY = 8, T_WIPE = 9, T_WEBFREE = 11 };
+enum { T_BOOT = 1, T_TRIM = 2, T_AUTOSAVE = 3, T_FMT = 4, T_FREE = 5, T_ANIM = 6, T_SEL = 7, T_QUERY = 8, T_WIPE = 9, T_WEBFREE = 11, T_USAGE = 13, T_FMT2 = 14 };
 
 static wstring g_dir, g_cfgPath, g_usagePath, g_hiddenPath, g_appsPath, g_filesPath;
 static wstring g_hotkey = L"Ctrl+Space", g_defaultBang = L"g";
@@ -116,7 +116,8 @@ static wstring g_webTrigger = L"w", g_webSearchUrl = L"https://www.google.com/se
 static vector<wstring> g_webExt;
 static int g_webW = 1100, g_webH = 720;
 static bool g_webPrivate = true, g_webBlockDl = true, g_webHttpsOnly = true, g_webLowRam = false;
-static int g_webKeepAlive = 45;   // seconds the browser stays warm after closing (instant reopen), then fully exits
+static bool g_urlSystemFirst = false;   // typed web address: offer the default browser first (url_open=system)
+static int g_webKeepAlive = 60;   // seconds the browser stays warm after closing (instant reopen), then fully exits
 static vector<wstring> g_webBlock;
 struct WebMark { wstring name, url; };
 static vector<WebMark> g_webMarks;
@@ -325,7 +326,9 @@ static void DefaultConfig() {
         L"# only https pages (http is upgraded; sites without https show an error). 0 = allow plain http\n"
         L"web_https_only=1\n"
         L"# seconds the browser stays warm after you close it (instant reopen), then it exits completely and frees all RAM\n"
-        L"web_keepalive=45\n"
+        L"web_keepalive=60\n"
+        L"# a typed web address (like  animex.one/home ) opens in: builtin = the built-in browser, system = your default browser\n"
+        L"url_open=builtin\n"
         L"# 1 = fewer browser processes and a smaller memory budget, but weaker isolation and slower heavy pages\n"
         L"web_lowram=0\n"
         L"# extra domains to block (ads/trackers are already blocked). e.g. web_block=annoying-ads.example\n"
@@ -409,6 +412,7 @@ static void LoadConfig() {
         else if (k == L"web_private") g_webPrivate = (v != L"0");
         else if (k == L"web_https_only") g_webHttpsOnly = (v != L"0");
         else if (k == L"web_lowram") g_webLowRam = (v == L"1");
+        else if (k == L"url_open") g_urlSystemFirst = (v == L"system");
         else if (k == L"web_keepalive") g_webKeepAlive = std::max(0, std::min(600, _wtoi(v.c_str())));
         else if (k == L"web_block") { if (!v.empty()) g_webBlock.push_back(v); }
         else if (k == L"web_bookmark") {
@@ -656,7 +660,8 @@ static void BuildCatalog() {
     Add(v, L"cmd:cmd", L"Command Prompt", L"Open cmd", L"terminal console shell", C_CMD, 0xE756, K_OPEN, L"cmd.exe");
     Add(v, L"cmd:powershell", L"PowerShell", L"Open PowerShell", L"terminal console shell", C_CMD, 0xE756, K_OPEN, L"powershell.exe");
     Add(v, L"cmd:regedit", L"Registry Editor", L"Open regedit", L"registry", C_CMD, 0xE713, K_OPEN, L"regedit.exe");
-    Add(v, L"cmd:settings", L"Quick Palette Settings", L"Opens config.ini: shortcut, bangs, your commands", L"preferences options hotkey config shortcut startup", C_CMD, 0xE713, K_EDITCFG);
+    Add(v, L"cmd:settings", L"Quick Palette Settings", L"Open the settings window", L"preferences options hotkey config shortcut startup customize", C_CMD, 0xE713, K_SETTINGS);
+    Add(v, L"cmd:configini", L"Open config.ini", L"Edit the settings file in Notepad", L"settings config file text", C_CMD, 0xE70F, K_EDITCFG);
     Add(v, L"cmd:reload", L"Reload app list", L"Re-scan installed apps", L"refresh index update", C_CMD, 0xE72C, K_RELOAD);
     Add(v, L"cmd:unhide", L"Unhide all hidden items", L"Bring back everything you hid", L"show restore reset", C_CMD, 0xE7B3, K_UNHIDE);
     Add(v, L"cmd:edithidden", L"Edit hidden items list", L"hidden.txt - delete a line to unhide one item", L"show restore", C_CMD, 0xE7B3, K_EDITHIDDEN);
@@ -1039,21 +1044,6 @@ static int ScoreText(const wstring& q, const vector<wstring>& toks, const Item& 
     return sum / (int)toks.size();
 }
 
-static bool LooksLikeUrl(const wstring& q) {
-    if (q.find(L' ') != wstring::npos) return false;
-    wstring l = lower(q);
-    if (l.rfind(L"http://", 0) == 0 || l.rfind(L"https://", 0) == 0 || l.rfind(L"localhost", 0) == 0) return true;
-    size_t slash = l.find(L'/');
-    wstring host = l.substr(0, slash);
-    size_t colon = host.find(L':');
-    if (colon != wstring::npos) host = host.substr(0, colon);
-    size_t dot = host.rfind(L'.');
-    if (dot == wstring::npos || dot == 0) return false;
-    static const wchar_t* tlds[] = { L"com", L"org", L"net", L"io", L"dev", L"app", L"in", L"co", L"edu", L"gov", L"ai", L"me", L"tv", L"uk", L"de", L"fr", L"info", L"xyz" };
-    wstring tld = host.substr(dot + 1);
-    for (auto t : tlds) if (tld == t) return true;
-    return false;
-}
 
 static inline wchar_t LC(wchar_t c) { return c < 128 ? (c >= L'A' && c <= L'Z' ? (wchar_t)(c + 32) : c) : (wchar_t)towlower(c); }
 static bool CIContains(const wchar_t* h, size_t hn, const wstring& nd) {
@@ -1182,26 +1172,48 @@ static wstring FormatDur(long s) {
     return o;
 }
 
+static bool LooksLikeAddress(const wstring& in, wstring& url, bool permissive) {   // a website address such as  animex.one/home
+    wstring t = Trim(in);
+    if (t.empty() || t.find(L' ') != wstring::npos) return false;
+    wstring l = lower(t);
+    if (l.rfind(L"http://", 0) == 0 || l.rfind(L"https://", 0) == 0) { url = t; return true; }
+    size_t slash = l.find_first_of(L"/?#");
+    bool hasPath = slash != wstring::npos;
+    wstring host = l.substr(0, slash);
+    size_t colon = host.find(L':');
+    if (colon != wstring::npos) {
+        wstring port = host.substr(colon + 1);
+        host = host.substr(0, colon);
+        if (port.empty() || port.find_first_not_of(L"0123456789") != wstring::npos) return false;
+    }
+    if (host.empty() || host.find(L'@') != wstring::npos) return false;
+    if (host == L"localhost") { url = L"http://" + t; return true; }
+    { bool ip = true; int dots = 0;
+      for (wchar_t c : host) { if (c == L'.') dots++; else if (!iswdigit(c)) { ip = false; break; } }
+      if (ip && dots == 3) { url = L"http://" + t; return true; } }
+    if (host.size() < 4 || host.front() == L'.' || host.back() == L'.') return false;
+    for (wchar_t c : host) if (!(iswalnum(c) || c == L'-' || c == L'.')) return false;
+    size_t dot = host.rfind(L'.');
+    if (dot == wstring::npos || dot == 0) return false;
+    wstring tld = host.substr(dot + 1);
+    bool puny = tld.rfind(L"xn--", 0) == 0;
+    if (tld.size() < 2 || tld.size() > 24) return false;
+    if (!puny) for (wchar_t c : tld) if (!iswalpha(c)) return false;
+    if (!permissive && !hasPath && host.rfind(L"www.", 0) != 0) {   // "notes.txt", "setup.exe" are files, not websites
+        static const wchar_t* files[] = { L"txt", L"md", L"exe", L"pdf", L"doc", L"docx", L"xls", L"xlsx", L"ppt", L"pptx", L"zip", L"rar", L"7z",
+            L"jpg", L"jpeg", L"png", L"gif", L"bmp", L"mp3", L"mp4", L"mkv", L"avi", L"mov", L"wav", L"ini", L"cfg", L"log", L"dll", L"sys",
+            L"bat", L"cmd", L"ps1", L"js", L"ts", L"py", L"cpp", L"h", L"c", L"cs", L"json", L"xml", L"csv", L"iso", L"msi", L"lnk",
+            L"url", L"tmp", L"bak", L"dat", L"db", L"htm", L"html", L"css", L"svg", L"ico", L"rtf", L"odt", L"tar", L"gz" };
+        for (auto f : files) if (tld == f) return false;
+    }
+    url = L"https://" + t;
+    return true;
+}
 static bool WebIsAddress(const wstring& in, wstring& url) {   // true = a website address, false = search words (url = search URL)
     wstring t = Trim(in);
     for (auto& c : t) if (c == L'\r' || c == L'\n') c = L' ';
     if (t.empty()) { url.clear(); return false; }
-    wstring l = lower(t);
-    if (l.rfind(L"http://", 0) == 0 || l.rfind(L"https://", 0) == 0) { url = t; return true; }
-    if (t.find(L' ') == wstring::npos) {
-        if (l.rfind(L"localhost", 0) == 0) { url = L"http://" + t; return true; }
-        size_t slash = l.find(L'/');
-        wstring host = l.substr(0, slash);
-        size_t colon = host.find(L':');
-        if (colon != wstring::npos) host = host.substr(0, colon);
-        size_t dot = host.rfind(L'.');
-        if (dot != wstring::npos && dot > 0 && host.size() - dot - 1 >= 2) {
-            bool alpha = true, ip = true;
-            for (size_t i = dot + 1; i < host.size(); i++) if (!iswalpha(host[i])) alpha = false;
-            for (wchar_t c : host) if (!iswdigit(c) && c != L'.') ip = false;
-            if (alpha || ip) { url = (ip ? L"http://" : L"https://") + t; return true; }
-        }
-    }
+    if (LooksLikeAddress(t, url, true)) return true;
     url = ReplaceAll(g_webSearchUrl, L"{q}", UrlEncode(t));
     return false;
 }
@@ -1358,12 +1370,14 @@ static vector<Item> RunQueryImpl(const wstring& raw) {
         it.title = L"= " + calc; it.sub = L"Calculator \u00B7 Enter copies the result"; it.kind = K_COPY; it.a = calc;
         res.push_back(it);
     }
-    if (LooksLikeUrl(q)) {
-        Item it; it.cat = C_OPEN; it.group = CatName(C_OPEN); it.glyph = DefaultGlyph(C_OPEN);
-        wstring l = lower(q);
-        wstring url = (l.rfind(L"http", 0) == 0) ? q : (l.rfind(L"localhost", 0) == 0 ? L"http://" : L"https://") + q;
-        it.title = L"Open " + q; it.sub = L"Open in your browser"; it.kind = K_OPEN; it.a = url;
-        res.push_back(it);
+    {   // a typed web address: any site works
+        wstring url;
+        if (LooksLikeAddress(q, url, false)) {
+            Item a; a.cat = C_OPEN; a.group = CatName(C_OPEN); a.glyph = DefaultGlyph(C_OPEN);
+            a.title = L"Open " + q; a.sub = L"In the built-in browser"; a.kind = K_BROWSE; a.a = q;
+            Item b = a; b.sub = L"In your default browser"; b.kind = K_OPEN; b.a = url;
+            if (g_urlSystemFirst) { res.push_back(b); res.push_back(a); } else { res.push_back(a); res.push_back(b); }
+        }
     }
     if (q.size() > 2 && (q[1] == L':' || q.rfind(L"\\\\", 0) == 0) && PathFileExistsW(q.c_str())) {
         Item it; it.cat = C_OPEN; it.group = CatName(C_OPEN); it.glyph = DefaultGlyph(C_OPEN);
@@ -1463,6 +1477,35 @@ static void ExitWin(UINT flags) {
 static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon = NIIF_INFO);
 
 static wstring ExpandNotePath(const wstring& p);
+static void OpenSettingsWindow();
+
+static void LaunchApp(const wstring& id) {   // fastest route to start an app (the shell's "AppsFolder" detour is the slow one)
+    if (id.rfind(L"lnk:", 0) == 0) { ShellExecuteW(nullptr, L"open", id.c_str() + 4, nullptr, nullptr, SW_SHOWNORMAL); return; }
+    if (id.find(L'!') != wstring::npos) {   // Store app: activate directly
+        IApplicationActivationManager* mgr = nullptr;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(ApplicationActivationManager), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&mgr))) && mgr) {
+            DWORD pid = 0;
+            HRESULT hr = mgr->ActivateApplication(id.c_str(), nullptr, AO_NONE, &pid);
+            mgr->Release();
+            if (SUCCEEDED(hr)) return;
+        }
+    } else if (id.size() > 3 && id[0] == L'{') {   // desktop app: "{known-folder-GUID}" + path -> the real path
+        size_t e = id.find(L'}');
+        GUID g;
+        if (e != wstring::npos && e + 1 < id.size() && id[e + 1] == L'\\' && SUCCEEDED(CLSIDFromString(id.substr(0, e + 1).c_str(), &g))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(SHGetKnownFolderPath(g, 0, nullptr, &p)) && p) {
+                wstring path = wstring(p) + id.substr(e + 1);
+                CoTaskMemFree(p);
+                if (PathFileExistsW(path.c_str())) { ShellExecuteW(nullptr, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return; }
+            }
+        }
+    } else if (id.size() > 3 && id[1] == L':' && PathFileExistsW(id.c_str())) {
+        ShellExecuteW(nullptr, L"open", id.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + id).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
 
 static void Exec(const Item& it) {
     if (it.confirm && MessageBoxW(nullptr, (it.title + L"?").c_str(), L"Quick Palette", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) != IDYES) return;
@@ -1470,10 +1513,7 @@ static void Exec(const Item& it) {
         case K_OPEN:
             ShellExecuteW(nullptr, L"open", ExpandEnv(it.a).c_str(), it.b.empty() ? nullptr : ExpandEnv(it.b).c_str(), nullptr, SW_SHOWNORMAL);
             break;
-        case K_APP:
-            if (it.a.rfind(L"lnk:", 0) == 0) ShellExecuteW(nullptr, L"open", it.a.c_str() + 4, nullptr, nullptr, SW_SHOWNORMAL);
-            else ShellExecuteW(nullptr, L"open", (L"shell:AppsFolder\\" + it.a).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
-            break;
+        case K_APP: LaunchApp(it.a); break;
         case K_LOCK: LockWorkStation(); break;
         case K_SLEEP: SetSuspendState(FALSE, FALSE, FALSE); break;
         case K_SHUTDOWN: ExitWin(EWX_POWEROFF); break;
@@ -1482,6 +1522,7 @@ static void Exec(const Item& it) {
         case K_RECYCLE: SHEmptyRecycleBinW(nullptr, nullptr, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND); break;
         case K_QUIT: DestroyWindow(g_hwnd); break;
         case K_EDITCFG: OpenFile(g_cfgPath); break;
+        case K_SETTINGS: OpenSettingsWindow(); break;
         case K_RELOAD: StartAppsThread(); break;
         case K_REINDEX: StartFilesThread(); break;
         case K_CFG: SetConfigValue(it.a, it.b); break;

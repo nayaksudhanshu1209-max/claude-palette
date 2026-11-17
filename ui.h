@@ -34,6 +34,11 @@ static HDC g_bbDC = nullptr; static HBITMAP g_bbBmp = nullptr, g_bbOld = nullptr
 static wchar_t g_uiFace[64] = L"Segoe UI", g_iconFace[64] = L"Segoe MDL2 Assets";
 static const UINT WM_PALETTE_PREFILL = WM_APP + 5;
 static bool g_queryPending = false;
+struct QChip { wstring trig, label, ph; COLORREF col; };   // a search "chip": the typed trigger (g, yt, w, f ...) shown as a named pill
+static bool g_chipOn = false;
+static QChip g_qchip;
+static RECT g_qchipRect = { 0, 0, 0, 0 };
+static ULONGLONG g_lastCfgCheck = 0;
 
 static void HidePalette();
 static void EnterNote(int idx);
@@ -180,9 +185,18 @@ static void PlaceWindow(int w, int h, bool show) {
     SetWindowPos(g_hwnd, show ? HWND_TOPMOST : nullptr, x, y, w, h, show ? SWP_SHOWWINDOW : (SWP_NOZORDER | SWP_NOACTIVATE));
 }
 
+static int ChipPx() {   // width of the chip pill
+    HDC dc = GetDC(nullptr);
+    HGDIOBJ o = SelectObject(dc, g_fHdr);
+    SIZE sz = { 0, 0 };
+    GetTextExtentPoint32W(dc, g_qchip.label.c_str(), (int)g_qchip.label.size(), &sz);
+    SelectObject(dc, o); ReleaseDC(nullptr, dc);
+    return (int)sz.cx + px(22);
+}
 static void LayoutChildren() {
     int eh = g_qLines * g_lineH;
-    MoveWindow(g_hQuery, px(52), (SearchH() - eh) / 2, PalW() - px(52) - px(20), eh, TRUE);
+    int x = px(52) + (g_chipOn ? ChipPx() + px(8) : 0);
+    MoveWindow(g_hQuery, x, (SearchH() - eh) / 2, std::max<int>(60, PalW() - x - px(20)), eh, TRUE);
 }
 static void ApplyLayout() {
     int w = PalW(), h = PalH();
@@ -253,6 +267,7 @@ static void MoveSel(int d, bool wrap = true) {
 static void RunSelected() {
     if (g_sel < 0 || g_sel >= (int)g_results.size()) return;
     Item it = g_results[g_sel];
+    if (it.kind == K_SETTINGS) { OpenSettingsWindow(); HidePalette(); return; }
     if (it.kind == K_BROWSE) { WebOpen(it.a); HidePalette(); return; }   // open first (we still own the foreground), then close the palette
     if (it.kind == K_NOTE) {
         for (size_t i = 0; i < g_notes.size(); i++)
@@ -260,7 +275,7 @@ static void RunSelected() {
         return;
     }
     HidePalette();
-    if (it.track) { g_usage[it.id]++; SaveUsage(); }
+    if (it.track) { g_usage[it.id]++; SetTimer(g_hwnd, T_USAGE, 1500, nullptr); }   // saved a moment later: launching comes first
     Exec(it);
 }
 static void HideIndex(int i) {
@@ -273,25 +288,26 @@ static void HideIndex(int i) {
     if (!g_results.empty()) { g_sel = std::min<int>(keep, (int)g_results.size() - 1); EnsureVisible(); SnapSel(); }
 }
 
-// ------------------------------------------------------------------ query box (a real multi-line EDIT control that grows)
-static void OnQueryChanged() {
-    if (g_suppress) return;
-    wstring raw = GetEditText(g_hQuery);
-    wstring low = lower(raw);
-    for (size_t i = 0; i < g_notes.size(); i++)
-        if (low == lower(g_notes[i].trig) + L" ") { EnterNote((int)i); HidePalette(); return; }   // "n " opens the note window
-    bool heavy = false;
-    size_t b = low.find_first_not_of(L' ');
-    if (b != wstring::npos) {
-        size_t e = low.find(L' ', b);
-        if (e != wstring::npos) {
-            wstring w0 = low.substr(b, e - b);
-            heavy = (w0 == lower(g_fileTrigger));
-            if (!g_webTrigger.empty() && w0 == lower(g_webTrigger)) WebEnsure();   // "w ": start the browser in the background now
-        }
-    }
-    g_query = raw;
+// ------------------------------------------------------------------ search-box chips
+// Typing "g ", "yt ", "w " or "f " turns the trigger into a named chip (Google, YouTube, Browser, Files ...).
+// Backspace at the start of the box (or a click on the chip) removes it and the palette is normal again.
+static bool FindChipFor(const wstring& word, QChip& out) {
+    wstring w = lower(word);
+    if (w.empty()) return false;
+    for (auto& n : g_notes) if (lower(n.trig) == w) return false;   // notes open straight away instead
+    if (!g_webTrigger.empty() && w == lower(g_webTrigger)) { out = QChip{ g_webTrigger, L"Browser", L"Type a website or search words", Accent(C_WEB) }; return true; }
+    if (w == lower(g_fileTrigger)) { out = QChip{ g_fileTrigger, L"Files", L"Search your files", Accent(C_FILE) }; return true; }
+    for (auto& b : g_bangs)
+        if (lower(b.trig) == w) { out = QChip{ b.trig, b.name, L"Search " + b.name, Accent(C_BANG) }; return true; }
+    return false;
+}
+static void ComposeQuery(const wstring& text) {
+    g_query = g_chipOn ? g_qchip.trig + L" " + text : text;
     for (auto& c : g_query) if (c == L'\r' || c == L'\n') c = L' ';
+}
+static void QueryTextChanged() {   // the box text is final: update height and schedule the search
+    ComposeQuery(GetEditText(g_hQuery));
+    bool heavy = g_chipOn && lower(g_qchip.trig) == lower(g_fileTrigger);
     int lines = (int)SendMessageW(g_hQuery, EM_GETLINECOUNT, 0, 0);
     lines = std::max<int>(1, std::min<int>(6, lines));
     bool changed = lines != g_qLines;
@@ -299,6 +315,40 @@ static void OnQueryChanged() {
     if (changed) { ApplyLayout(); SendMessageW(g_hQuery, EM_LINESCROLL, 0, -100); }
     g_queryPending = true;
     SetTimer(g_hwnd, T_QUERY, heavy ? 45 : 22, nullptr);   // results follow a moment after the last keystroke: typing never waits for a search
+}
+static void SetChip(const QChip& c) {
+    g_qchip = c; g_chipOn = true;
+    g_lastSig = -1;
+    ApplyLayout();
+    if (!g_webTrigger.empty() && lower(c.trig) == lower(g_webTrigger)) WebEnsure();   // "w ": start the browser engine in the background now
+}
+static void ClearChip() {
+    g_chipOn = false;
+    g_lastSig = -1;
+    ApplyLayout();
+}
+static void OnQueryChanged() {
+    if (g_suppress) return;
+    wstring raw = GetEditText(g_hQuery);
+    wstring low = lower(raw);
+    for (size_t i = 0; i < g_notes.size(); i++)
+        if (low == lower(g_notes[i].trig) + L" ") { EnterNote((int)i); HidePalette(); return; }   // "n " opens the note window
+    if (!g_chipOn) {
+        size_t b = raw.find_first_not_of(L' ');
+        if (b != wstring::npos) {
+            size_t e = raw.find(L' ', b);
+            QChip c;
+            if (e != wstring::npos && e > b && FindChipFor(raw.substr(b, e - b), c)) {
+                wstring rest = raw.substr(e + 1);
+                g_suppress = true;
+                SetWindowTextW(g_hQuery, rest.c_str());
+                SendMessageW(g_hQuery, EM_SETSEL, (WPARAM)rest.size(), (LPARAM)rest.size());
+                g_suppress = false;
+                SetChip(c);
+            }
+        }
+    }
+    QueryTextChanged();
 }
 
 static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -321,6 +371,13 @@ static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                         Reveal(p);
                     } else RunSelected();
                     return 0;
+                case VK_BACK:
+                    if (g_chipOn && !ctrl) {
+                        DWORD sa = 0, sb = 0;
+                        SendMessageW(h, EM_GETSEL, (WPARAM)&sa, (LPARAM)&sb);
+                        if (sa == 0 && sb == 0) { ClearChip(); QueryTextChanged(); return 0; }   // nothing before the caret: remove the chip
+                    }
+                    break;
                 case 'H': if (ctrl) { HideIndex(g_sel); return 0; } break;
                 case 'D':   // pin / unpin the selected item (shows first when the box is empty)
                     if (ctrl && g_sel >= 0 && g_sel < (int)g_results.size() && g_results[g_sel].track) {
@@ -358,7 +415,7 @@ static LRESULT CALLBACK QueryProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 RECT rc; GetClientRect(h, &rc);
                 rc.left += px(2);
                 SetBkMode(dc, TRANSPARENT);
-                TextAt(dc, g_fSearch, g_th->placeholder, L"Search apps, files, settings\u2026   f report \u00B7 g cats \u00B7 n notes \u00B7 w web", rc, DT_VCENTER);
+                TextAt(dc, g_fSearch, g_th->placeholder, g_chipOn ? g_qchip.ph : wstring(L"Search apps, files, settings\u2026   f report \u00B7 g cats \u00B7 n notes \u00B7 w web"), rc, DT_VCENTER);
                 ReleaseDC(h, dc);
             }
             return r;
@@ -398,6 +455,12 @@ static void DrawPalette(HDC dc, int W, int H) {
 
     wchar_t g[2] = { 0xE721, 0 };
     TextAt(dc, g_fIcon, T.hdr, g, { px(20), SearchPadV(), px(48), SearchPadV() + g_lineH }, DT_VCENTER);
+    if (g_chipOn) {
+        int ch = std::min<int>(px(26), g_lineH), cy = SearchPadV() + (g_lineH - ch) / 2;
+        g_qchipRect = { px(52), cy, px(52) + ChipPx(), cy + ch };
+        FillRound(dc, g_qchipRect, g_qchip.col, px(9));
+        TextAt(dc, g_fHdr, RGB(255, 255, 255), g_qchip.label, g_qchipRect, DT_CENTER | DT_VCENTER);
+    }
     if (g_rows.empty()) return;
 
     FillRectC(dc, { 1, SearchH(), W - 1, SearchH() + 1 }, T.divider);
@@ -535,6 +598,7 @@ static HWND MakeToolWindow(HWND* slot, const wchar_t* title, int w96, int h96) {
 
 #include "note.h"
 #include "web.h"
+#include "settings.h"
 
 static LRESULT CALLBACK ToolProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (h == g_nw) return NoteProc(h, msg, wp, lp);
@@ -548,12 +612,17 @@ static void ForceForeground(HWND h) { SetForegroundWindow(h); BringWindowToTop(h
 static void ShowPalette() {
     if (IsWindowVisible(g_hwnd)) return;
     KillTimer(g_hwnd, T_FREE); KillTimer(g_hwnd, T_TRIM);
-    if (Stamp(g_cfgPath) != g_cfgStamp) {
-        LoadConfig(); SyncStartup(); RegisterHotkey();
-        FreeFiles();
-        if (!FilesCacheFresh()) StartFilesThread();
+    ULONGLONG nowTick = GetTickCount64();
+    if (nowTick - g_lastCfgCheck > 4000) {   // disk and registry are only checked every few seconds (faster opening on slow PCs)
+        g_lastCfgCheck = nowTick;
+        if (Stamp(g_cfgPath) != g_cfgStamp) {
+            LoadConfig(); SyncStartup(); RegisterHotkey();
+            FreeFiles();
+            if (!FilesCacheFresh()) StartFilesThread();
+        }
+        ApplyTheme();
     }
-    ApplyTheme();
+    g_chipOn = false;
     POINT pt; GetCursorPos(&pt);
     HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO mi = { sizeof(mi) };
@@ -582,10 +651,10 @@ static void ShowPalette() {
     ForceForeground(g_hwnd);
     SetFocus(g_hQuery);
 }
-static void ShowPalettePrefill(const wstring& text) {
+static void ShowPaletteWithChip(const wstring& trig) {   // palette with a chip already in place (e.g. from the browser)
     ShowPalette();
-    SetWindowTextW(g_hQuery, text.c_str());
-    SendMessageW(g_hQuery, EM_SETSEL, (WPARAM)text.size(), (LPARAM)text.size());
+    QChip c;
+    if (FindChipFor(trig, c)) { SetChip(c); ComposeQuery(L""); Refresh(); }
 }
 
 static void HidePalette() {
@@ -616,7 +685,8 @@ static void Balloon(const wchar_t* title, const wchar_t* msg, DWORD icon) {
 static void TrayMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"Open palette");
-    AppendMenuW(m, MF_STRING, 2, L"Edit settings");
+    AppendMenuW(m, MF_STRING, 2, L"Settings");
+    AppendMenuW(m, MF_STRING, 5, L"Open config.ini");
     AppendMenuW(m, MF_STRING, 3, L"Reload app list");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, 4, L"Quit");
@@ -626,7 +696,8 @@ static void TrayMenu() {
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
     if (c == 1) ShowPalette();
-    else if (c == 2) OpenFile(g_cfgPath);
+    else if (c == 2) OpenSettingsWindow();
+    else if (c == 5) OpenFile(g_cfgPath);
     else if (c == 3) StartAppsThread();
     else if (c == 4) DestroyWindow(g_hwnd);
 }
@@ -634,10 +705,12 @@ static void TrayMenu() {
 static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_HOTKEY:
-            if (IsWindowVisible(h)) HidePalette(); else ShowPalette();
+            if (IsWindowVisible(h)) HidePalette();
+            else if (g_ww && g_webShown && !g_webTrigger.empty() && GetForegroundWindow() == g_ww) ShowPaletteWithChip(g_webTrigger);   // browser focused: palette starts as a web search
+            else ShowPalette();
             return 0;
         case WM_SHOWME: ShowPalette(); return 0;
-        case WM_PALETTE_PREFILL: ShowPalettePrefill(L"w "); return 0;
+        case WM_PALETTE_PREFILL: ShowPaletteWithChip(g_webTrigger); return 0;
         case WM_APPS_READY: {
             auto* v = (vector<AppEntry>*)lp;
             g_apps = std::move(*v); delete v;
@@ -688,6 +761,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (std::fabs(d) < 1.5) { g_selY = tg; KillTimer(h, T_SEL); } else g_selY += d * 0.45;
                 RECT r = { 0, ListTop(), PalW(), ListTop() + ListH() };
                 InvalidateRect(h, &r, FALSE);
+            } else if (wp == T_USAGE) {
+                KillTimer(h, T_USAGE);
+                SaveUsage();
             } else if (wp == T_QUERY) {
                 Refresh();
             } else if (wp == T_WEBFREE) {
@@ -770,6 +846,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_LBUTTONUP: {
             if (g_drag) { g_drag = 0; ReleaseCapture(); return 0; }
+            POINT cp = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            if (g_chipOn && PtInRect(&g_qchipRect, cp)) { ClearChip(); QueryTextChanged(); if (g_hQuery) SetFocus(g_hQuery); return 0; }   // click the chip to remove it
             int i = HitTest(GET_Y_LPARAM(lp));
             if (i >= 0) { g_sel = i; RunSelected(); }
             return 0;
@@ -861,6 +939,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     tc.hIcon = wc.hIcon; tc.hIconSm = wc.hIconSm;
     tc.lpszClassName = kToolClass;
     RegisterClassExW(&tc);
+    RegisterSettingsClasses(inst);
 
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kClass, L"Quick Palette", WS_POPUP | WS_CLIPCHILDREN, 0, 0, px(640), px(60), nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
@@ -873,7 +952,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmd, int) {
     g_wmTaskbar = RegisterWindowMessageW(L"TaskbarCreated");
     AddTray();
     if (!RegisterHotkey())
-        Balloon(L"Quick Palette", L"The shortcut in config.ini is invalid or used by another app. Edit it via the tray icon > Edit settings.", NIIF_WARNING);
+        Balloon(L"Quick Palette", L"The shortcut in config.ini is invalid or used by another app. Change it in the tray icon > Settings.", NIIF_WARNING);
 
     if (g_firstRun) {   // ask once, explicitly - nothing is added to startup without a Yes
         int r = MessageBoxW(nullptr,

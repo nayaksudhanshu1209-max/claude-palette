@@ -15,6 +15,8 @@ static wstring g_notePath;
 static HMODULE g_hRich = nullptr;
 static ITextDocument* g_tom = nullptr;
 static vector<char> g_fmtState;
+static int g_bgLine = -1;                                   // next line for the background formatting pass
+static const UINT WM_NOTE_LOAD = WM_APP + 31;
 
 static int NStat() { return px(40); }
 static int NMargin() { return px(18); }
@@ -368,48 +370,79 @@ static int LineOf(const vector<LONG>& ls, LONG pos) {
     return lo;
 }
 
+struct NDoc {
+    wstring txt; vector<LONG> ls; vector<char> st; int nl = 0;
+    wstring line(int i) const {
+        LONG a = ls[(size_t)i], e = (i + 1 < nl) ? ls[(size_t)i + 1] - 1 : (LONG)txt.size();
+        return txt.substr((size_t)a, (size_t)(e - a));
+    }
+};
+static void ScanDoc(NDoc& d) {
+    d.txt = RichGet(g_hEd);
+    d.ls.assign(1, 0);
+    for (size_t i = 0; i < d.txt.size(); i++) if (d.txt[i] == L'\r') d.ls.push_back((LONG)i + 1);
+    d.nl = (int)d.ls.size();
+    d.st.assign((size_t)d.nl, 0);
+    bool in = false;
+    for (int i = 0; i < d.nl; i++) { bool f = IsFenceLine(d.line(i)); d.st[(size_t)i] = f ? 2 : (in ? 1 : 0); if (f) in = !in; }
+}
+struct FmtScope {   // while formatting: no redraw, no undo entries, selection and scroll position kept
+    CHARRANGE sel; int firstVis;
+    FmtScope() {
+        sel = { 0, 0 };
+        SendMessageW(g_hEd, EM_EXGETSEL, 0, (LPARAM)&sel);
+        firstVis = (int)SendMessageW(g_hEd, EM_GETFIRSTVISIBLELINE, 0, 0);
+        SendMessageW(g_hEd, WM_SETREDRAW, FALSE, 0);
+        if (g_tom) { long c = 0; g_tom->Undo(tomSuspend, &c); }
+        g_noteBusy = true;
+    }
+    ~FmtScope() {
+        if (g_tom) { long c = 0; g_tom->Undo(tomResume, &c); }
+        SendMessageW(g_hEd, EM_EXSETSEL, 0, (LPARAM)&sel);
+        int nowVis = (int)SendMessageW(g_hEd, EM_GETFIRSTVISIBLELINE, 0, 0);
+        if (nowVis != firstVis) SendMessageW(g_hEd, EM_LINESCROLL, 0, firstVis - nowVis);
+        SendMessageW(g_hEd, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_hEd, nullptr, TRUE);
+        g_noteBusy = false;
+    }
+};
+
 // Re-formats only the lines that need it: the caret line, the line the caret just left, and lines whose code-fence state changed.
+// A first/full pass formats the lines around the caret at once and the rest in small background steps (big notes open instantly).
 static void NoteFormat(bool full) {
     if (!g_hEd || g_noteBusy || g_noteLoading) return;
-    g_noteBusy = true;
-    wstring txt = RichGet(g_hEd);
-    vector<LONG> ls; ls.push_back(0);
-    for (size_t i = 0; i < txt.size(); i++) if (txt[i] == L'\r') ls.push_back((LONG)i + 1);
-    int nl = (int)ls.size();
-    auto lineText = [&](int i) { LONG s = ls[i], e = (i + 1 < nl) ? ls[i + 1] - 1 : (LONG)txt.size(); return txt.substr((size_t)s, (size_t)(e - s)); };
-
-    vector<char> st((size_t)nl, 0);
-    bool in = false;
-    for (int i = 0; i < nl; i++) { bool f = IsFenceLine(lineText(i)); st[i] = f ? 2 : (in ? 1 : 0); if (f) in = !in; }
-
-    CHARRANGE sel = { 0, 0 };
-    SendMessageW(g_hEd, EM_EXGETSEL, 0, (LPARAM)&sel);
-    int cur = LineOf(ls, sel.cpMin);
-    vector<char> dirty((size_t)nl, 0);
-    if (full || g_fmtState.empty()) std::fill(dirty.begin(), dirty.end(), (char)1);
-    else {
-        size_t on = g_fmtState.size(), n = (size_t)nl, p = 0, q = 0;
-        while (p < n && p < on && st[p] == g_fmtState[p]) p++;
-        while (q < n - p && q < on - p && st[n - 1 - q] == g_fmtState[on - 1 - q]) q++;
+    NDoc d; ScanDoc(d);
+    FmtScope fs;
+    int cur = LineOf(d.ls, fs.sel.cpMin);
+    vector<char> dirty((size_t)d.nl, 0);
+    if (full || g_fmtState.empty()) {
+        for (int i = std::max(0, cur - 40); i <= std::min(d.nl - 1, cur + 40); i++) dirty[(size_t)i] = 1;
+        g_bgLine = 0;
+        SetTimer(g_nw, T_FMT2, 15, nullptr);
+    } else {
+        size_t on = g_fmtState.size(), n = (size_t)d.nl, p = 0, q = 0;
+        while (p < n && p < on && d.st[p] == g_fmtState[p]) p++;
+        while (q < n - p && q < on - p && d.st[n - 1 - q] == g_fmtState[on - 1 - q]) q++;
         for (size_t i = p; i + q < n; i++) dirty[i] = 1;
-        auto mark = [&](int i) { if (i >= 0 && i < nl) dirty[(size_t)i] = 1; };
+        auto mark = [&](int i) { if (i >= 0 && i < d.nl) dirty[(size_t)i] = 1; };
         mark(cur); mark(g_prevLine); mark(cur - 1); mark(cur + 1);
-        if (nl != (int)on) { int a = std::min(cur, g_prevLine), b = std::max(cur, g_prevLine); for (int i = a - 1; i <= b + 1; i++) mark(i); }
+        if (d.nl != (int)on) { int a = std::min(cur, g_prevLine), b = std::max(cur, g_prevLine); for (int i = a - 1; i <= b + 1; i++) mark(i); }
     }
-
-    int firstVis = (int)SendMessageW(g_hEd, EM_GETFIRSTVISIBLELINE, 0, 0);
-    SendMessageW(g_hEd, WM_SETREDRAW, FALSE, 0);
-    if (g_tom) { long c = 0; g_tom->Undo(tomSuspend, &c); }   // formatting must not fill the undo stack
-    for (int i = 0; i < nl; i++) if (dirty[(size_t)i]) FormatLine(ls[i], lineText(i), st[i], sel.cpMin, sel.cpMax);
-    if (g_tom) { long c = 0; g_tom->Undo(tomResume, &c); }
-    SendMessageW(g_hEd, EM_EXSETSEL, 0, (LPARAM)&sel);
-    int nowVis = (int)SendMessageW(g_hEd, EM_GETFIRSTVISIBLELINE, 0, 0);
-    if (nowVis != firstVis) SendMessageW(g_hEd, EM_LINESCROLL, 0, firstVis - nowVis);
-    SendMessageW(g_hEd, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(g_hEd, nullptr, TRUE);
-    g_fmtState = st;
+    for (int i = 0; i < d.nl; i++) if (dirty[(size_t)i]) FormatLine(d.ls[(size_t)i], d.line(i), d.st[(size_t)i], fs.sel.cpMin, fs.sel.cpMax);
+    g_fmtState = d.st;
     g_prevLine = cur;
-    g_noteBusy = false;
+}
+static void NoteFormatChunk() {   // background step: 60 more lines
+    if (!g_hEd || g_noteBusy || g_noteLoading || g_bgLine < 0) return;
+    NDoc d; ScanDoc(d);
+    if (g_bgLine >= d.nl) { g_bgLine = -1; return; }
+    {
+        FmtScope fs;
+        int to = std::min(d.nl, g_bgLine + 60);
+        for (int i = g_bgLine; i < to; i++) FormatLine(d.ls[(size_t)i], d.line(i), d.st[(size_t)i], fs.sel.cpMin, fs.sel.cpMax);
+        g_bgLine = (to >= d.nl) ? -1 : to;
+    }
+    if (g_bgLine >= 0) SetTimer(g_nw, T_FMT2, 12, nullptr);
 }
 static void NoteSchedule() { if (g_nw && !g_noteBusy && !g_noteLoading) SetTimer(g_nw, T_FMT, 25, nullptr); }
 
@@ -653,7 +686,8 @@ static void NoteLayout() {
 }
 
 static void NoteContentClose() {
-    if (g_nw) { KillTimer(g_nw, T_AUTOSAVE); KillTimer(g_nw, T_FMT); }
+    if (g_nw) { KillTimer(g_nw, T_AUTOSAVE); KillTimer(g_nw, T_FMT); KillTimer(g_nw, T_FMT2); }
+    g_bgLine = -1;
     if (g_tom) { g_tom->Release(); g_tom = nullptr; }
     if (g_hEd) { DestroyWindow(g_hEd); g_hEd = nullptr; g_oldEd = nullptr; }
     g_chipRects.clear(); g_fmtState.clear(); g_chipDown = false;
@@ -700,7 +734,7 @@ static bool NoteLoad(int idx) {
 static void EnterNote(int idx) {
     if (idx < 0 || idx >= (int)g_notes.size()) return;
     if (g_noteOpen && g_nw) {   // already open: switch note if needed, then bring it forward
-        if (g_noteIdx != idx) { SaveNote(); NoteContentClose(); NoteLoad(idx); }
+        if (g_noteIdx != idx) { SaveNote(); NoteContentClose(); g_noteIdx = idx; PostMessageW(g_nw, WM_NOTE_LOAD, (WPARAM)idx, 0); }
         if (IsIconic(g_nw)) ShowWindow(g_nw, SW_RESTORE);
         SetForegroundWindow(g_nw);
         if (g_hEd) SetFocus(g_hEd);
@@ -708,10 +742,10 @@ static void EnterNote(int idx) {
     }
     if (!MakeToolWindow(&g_nw, L"Notes", g_noteW, g_noteH)) return;
     g_noteOpen = true;
-    if (!NoteLoad(idx)) { DestroyWindow(g_nw); return; }
-    ShowWindow(g_nw, SW_SHOW);
+    g_noteIdx = idx;
+    ShowWindow(g_nw, SW_SHOW);            // the window appears immediately ...
     SetForegroundWindow(g_nw);
-    if (g_hEd) SetFocus(g_hEd);
+    PostMessageW(g_nw, WM_NOTE_LOAD, (WPARAM)idx, 0);   // ... and the file loads right after
 }
 static void ExitNote() {   // the note window was destroyed
     NoteContentClose();
@@ -777,6 +811,10 @@ static LRESULT CALLBACK NoteProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (ToolFrameMsg(h, msg, wp, lp, out)) return out;
     switch (msg) {
         case WM_ERASEBKGND: return 1;
+        case WM_NOTE_LOAD:
+            if (!NoteLoad((int)wp)) DestroyWindow(h);
+            else if (g_hEd) SetFocus(g_hEd);
+            return 0;
         case WM_NCHITTEST: {
             POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             int e = EdgeHit(h, p);
@@ -824,6 +862,7 @@ static LRESULT CALLBACK NoteProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == T_AUTOSAVE) SaveNote();
             else if (wp == T_FMT) { KillTimer(h, T_FMT); NoteFormat(false); }
+            else if (wp == T_FMT2) { KillTimer(h, T_FMT2); NoteFormatChunk(); }
             return 0;
         case WM_MOUSEMOVE: {
             int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);

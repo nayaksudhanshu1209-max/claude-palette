@@ -68,6 +68,10 @@ static ComPtr<ICoreWebView2Controller> g_wvCtl;
 static ComPtr<ICoreWebView2> g_wv;
 static wstring g_webPending;
 static int g_extPending = 0;
+static ComPtr<ICoreWebView2_19> g_w19;
+static void WebMemory(bool shown) {   // normal speed while you browse, smallest memory while it is hidden
+    if (g_w19) g_w19->put_MemoryUsageTargetLevel(shown ? COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL : COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW);
+}
 
 static bool UriAllowed(const wchar_t* uri) {   // only web pages
     return uri && (_wcsnicmp(uri, L"https://", 8) == 0 || _wcsnicmp(uri, L"http://", 7) == 0 || _wcsnicmp(uri, L"about:blank", 11) == 0);
@@ -122,8 +126,7 @@ static void WebSetup() {
         ComPtr<ICoreWebView2Settings8> s8;
         if (SUCCEEDED(st.As(&s8))) s8->put_IsReputationCheckingRequired(TRUE);   // SmartScreen on
     }
-    ComPtr<ICoreWebView2_19> w19;
-    if (SUCCEEDED(g_wv.As(&w19))) w19->put_MemoryUsageTargetLevel(COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW);
+    if (SUCCEEDED(g_wv.As(&g_w19))) WebMemory(g_webShown);
 
     ComPtr<ICoreWebView2_13> w13; ComPtr<ICoreWebView2Profile> prof; ComPtr<ICoreWebView2Profile7> p7;
     if (SUCCEEDED(g_wv.As(&w13)) && SUCCEEDED(w13->get_Profile(&prof))) {
@@ -292,10 +295,10 @@ static void WebCreate() {
 static void WebTeardown() {
     g_webReady = false; g_webCreating = false;
     if (g_wvCtl) { g_wvCtl->Close(); g_wvCtl.Reset(); }
-    g_wv.Reset(); g_wvEnv.Reset();
+    g_wv.Reset(); g_wvEnv.Reset(); g_w19.Reset();
     g_webPending.clear();
 }
-static void WebSetVisible(bool v) { if (g_wvCtl) g_wvCtl->put_IsVisible(v ? TRUE : FALSE); }
+static void WebSetVisible(bool v) { if (g_wvCtl) g_wvCtl->put_IsVisible(v ? TRUE : FALSE); WebMemory(v); }
 static void WebBlank() { if (g_wv && g_webReady) g_wv->Navigate(L"about:blank"); g_webPending.clear(); }
 #else
 static void WebResize() {}

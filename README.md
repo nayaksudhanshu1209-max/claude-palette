@@ -53,7 +53,14 @@ Type: `f report` (file search) · `g cats` / `yt lofi` (web bangs) · `n ` (note
 - Memory: it stays warm 45 s after closing (instant reopen), then exits completely. Several `msedgewebview2.exe` processes are normal.
   `web_lowram=1` trims them at the cost of isolation and speed.
 
+## Search chips
+Type a trigger and a space (`g `, `yt `, `w `, `f ` ...) and it turns into a named chip (Google, YouTube, Browser, Files ...) in front of the
+search box, so you only type the search itself. Backspace at the start of the box (or a click on the chip) removes it and the palette is normal
+again. If the built-in browser is the focused window, the hotkey opens the palette with the Browser chip already in place.
+
 ## Settings
-Tray icon > Edit settings opens `config.ini` (reloaded the next time you open the palette). Useful lines: `folder=` (file search),
+Tray icon > Settings (or type "settings" in the palette) opens a settings window with tabs. It only changes values in `config.ini`, which you can
+still edit by hand (tray icon > Open config.ini); the window always shows what is in the file.
+Useful lines in `config.ini`: `folder=` (file search),
 `quick_folders=` (which quick-folder commands exist), `theme`, `compact`, `at_cursor`, `show_recent`, `animations`, `note=`, `web_*`.
 You can also type "theme dark", "compact", "cursor", "animations" or "browser search" in the palette to switch options.
